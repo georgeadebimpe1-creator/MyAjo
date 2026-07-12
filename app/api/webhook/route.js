@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import { supabase } from '../../lib/supabase'
 import twilio from 'twilio'
+import { quoteWithdrawalForCycle, processWithdrawal, stubPayout, getWithdrawableBalance } from '../../lib/withdrawal'
 
 const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
 
@@ -80,7 +81,7 @@ async function handleMessage(from, body) {
 
         if (activeCycle) {
           await clearSession(whatsapp)
-          return `You already have an active savings cycle running.\n\nType BALANCE to check your savings or SAVE followed by your reference to record today's contribution.`
+          return `You already have an active savings cycle running.\n\nType BALANCE to check your savings, SAVE followed by your reference to record today's contribution, or WITHDRAW followed by an amount to withdraw.`
         }
       }
 
@@ -124,7 +125,7 @@ async function handleMessage(from, body) {
 
     if (message === '3') {
       await clearSession(whatsapp)
-      return `How MyAjo Works\n\nMyAjo is a digital daily savings platform built on the trusted ajo tradition.\n\n1. You choose how much to save every day\n2. You save daily for 30 days\n3. At the end of 30 days you collect your full savings minus one day as MyAjo commission\n\nExample:\nSave N1,000 every day\nTotal after 30 days: N30,000\nMyAjo commission: N1,000 (one day)\nYou receive: N29,000\n\nYour money is safe and held by our licensed banking partner.\n\nType 1 to start saving today.`
+      return `How MyAjo Works\n\nMyAjo is a digital daily savings platform built on the trusted ajo tradition.\n\n1. You choose how much to save every day\n2. You save daily for 30 days\n3. At the end of 30 days you collect your full savings minus one day as MyAjo commission\n\nExample:\nSave N1,000 every day\nTotal after 30 days: N30,000\nMyAjo commission: N1,000 (one day)\nYou receive: N29,000\n\nNeed your money before 30 days? You can withdraw anytime after day 10 — a small fee from our banking partner applies (N50 for withdrawals up to N10,000, N100 above that). MyAjo never charges you extra for this.\n\nYour money is safe and held by our licensed banking partner.\n\nType 1 to start saving today.`
     }
 
     if (message === '4') {
@@ -261,7 +262,7 @@ async function handleMessage(from, body) {
 
     const { data: cycle } = await supabase
       .from('cycles')
-      .select('id, daily_amount, days_contributed, total_saved, commission')
+      .select('id, daily_amount, days_contributed, total_saved, commission, bank_name, partial_withdrawals')
       .eq('user_id', user.id)
       .eq('status', 'active')
       .single()
@@ -309,19 +310,25 @@ async function handleMessage(from, body) {
       .eq('id', cycle.id)
 
     if (newDays === 30) {
-      await supabase
-        .from('cycles')
-        .update({ status: 'completed' })
-        .eq('id', cycle.id)
+      // Full cycle completed, no early withdrawal taken along the way.
+      // Route the payout through the same withdrawal engine used for
+      // WITHDRAW, so there is one single source of truth for the money
+      // math rather than duplicating it here.
+      const updatedCycle = { ...cycle, days_contributed: newDays, total_saved: newTotal }
+      const withdrawableBalance = await getWithdrawableBalance(updatedCycle)
+      const result = await processWithdrawal(cycle.id, withdrawableBalance, stubPayout)
 
-      return `Congratulations ${user.full_name}!\n\nYou have completed your 30 day savings plan!\n\nTotal saved: N${newTotal.toLocaleString()}\nMyAjo commission: N${commission.toLocaleString()} (one day)\nYour payout: N${(newTotal - commission).toLocaleString()}\n\nYour payout is being processed to your ${cycle.bank_name || 'registered'} account. We will notify you once it has been sent.\n\nThank you for saving with MyAjo. Would you like to start another cycle? Type 1 to begin.`
+      if (!result.success) {
+        return `Congratulations ${user.full_name}!\n\nYou have completed your 30 day savings plan, but your payout could not be processed automatically (${result.reason}).\n\nPlease contact support at hello@myajo.ng and we will resolve this right away.`
+      }
+
+      return `Congratulations ${user.full_name}!\n\nYou have completed your 30 day savings plan!\n\nTotal saved: N${newTotal.toLocaleString()}\nMyAjo commission: N${commission.toLocaleString()} (one day)\nYour payout: N${result.netAmount.toLocaleString()}\n\nYour payout is being sent to your ${cycle.bank_name || 'registered'} account. We will notify you once it has been sent.\n\nThank you for saving with MyAjo. Would you like to start another cycle? Type 1 to begin.`
     }
 
-    const bar = '|' + 'filled'.repeat(Math.round((newDays / 30) * 10)).replace(/filled/g, '') + 'empty'.repeat(10 - Math.round((newDays / 30) * 10)).replace(/empty/g, '') + '|'
     const filled = Math.round((newDays / 30) * 10)
     const progressDisplay = '[' + '#'.repeat(filled) + '-'.repeat(10 - filled) + ']'
 
-    return `Payment received ${user.full_name}!\n\nDay ${newDays} of 30 recorded.\n\nProgress: ${progressDisplay} ${Math.round((newDays / 30) * 100)}%\n\nYou have saved: N${newTotal.toLocaleString()}\nDays remaining: ${daysRemaining}\n\n${daysRemaining <= 5 ? 'You are almost there! Keep going!' : 'Stay consistent. Every day counts!'}`
+    return `Payment received ${user.full_name}!\n\nDay ${newDays} of 30 recorded.\n\nProgress: ${progressDisplay} ${Math.round((newDays / 30) * 100)}%\n\nYou have saved: N${newTotal.toLocaleString()}\nDays remaining: ${daysRemaining}\n\n${daysRemaining <= 5 ? 'You are almost there! Keep going!' : 'Stay consistent. Every day counts!'}${newDays === 10 ? '\n\nYou can now withdraw anytime you like if you need to. Type HELP to see how withdrawals work.' : ''}`
   }
 
   if (upper === 'BALANCE') {
@@ -352,8 +359,74 @@ async function handleMessage(from, body) {
     const expectedPayout = expectedTotal - commission
     const filled = Math.round((cycle.days_contributed / 30) * 10)
     const progressDisplay = '[' + '#'.repeat(filled) + '-'.repeat(10 - filled) + ']'
+    const withdrawLine = cycle.days_contributed >= 10
+      ? `\n\nYou can withdraw anytime. Type WITHDRAW followed by an amount.`
+      : `\n\nWithdrawals unlock on day 10 (${10 - cycle.days_contributed} day${10 - cycle.days_contributed === 1 ? '' : 's'} to go).`
 
-    return `Your Savings\n\nHello ${user.full_name}\n\nSaved: N${parseFloat(cycle.total_saved).toLocaleString()}\nDays completed: ${cycle.days_contributed} of 30\n\nProgress: ${progressDisplay} ${Math.round((cycle.days_contributed / 30) * 100)}%\n\nExpected total: N${expectedTotal.toLocaleString()}\nMyAjo commission: N${commission.toLocaleString()}\nYour payout: N${expectedPayout.toLocaleString()}\n\nKeep saving every day!`
+    return `Your Savings\n\nHello ${user.full_name}\n\nSaved: N${parseFloat(cycle.total_saved).toLocaleString()}\nDays completed: ${cycle.days_contributed} of 30\n\nProgress: ${progressDisplay} ${Math.round((cycle.days_contributed / 30) * 100)}%\n\nExpected total: N${expectedTotal.toLocaleString()}\nMyAjo commission: N${commission.toLocaleString()}\nYour payout: N${expectedPayout.toLocaleString()}${withdrawLine}\n\nKeep saving every day!`
+  }
+
+  if (upper.startsWith('WITHDRAW')) {
+    const parts = message.split(' ')
+    const amount = parseFloat((parts[1] || '').replace(/,/g, ''))
+
+    const { data: user } = await supabase
+      .from('users')
+      .select('id, full_name')
+      .eq('whatsapp_number', whatsapp)
+      .single()
+
+    if (!user) {
+      return `I could not find your account. Type MENU to get started.`
+    }
+
+    const { data: cycle } = await supabase
+      .from('cycles')
+      .select('*')
+      .eq('user_id', user.id)
+      .eq('status', 'active')
+      .single()
+
+    if (!cycle) {
+      return `You do not have an active savings cycle. Type 1 to start one.`
+    }
+
+    if (isNaN(amount)) {
+      return `To withdraw, send WITHDRAW followed by the amount.\n\nExample: WITHDRAW 5000`
+    }
+
+    const quote = await quoteWithdrawalForCycle(cycle, amount)
+
+    if (!quote.allowed) {
+      return quote.reason
+    }
+
+    await updateSession(whatsapp, 'awaiting_withdrawal_confirmation', {
+      cycleId: cycle.id,
+      requestedAmount: quote.requestedAmount,
+    })
+
+    return quote.confirmationMessage
+  }
+
+  if (upper === 'YES' && step === 'awaiting_withdrawal_confirmation') {
+    const result = await processWithdrawal(temp.cycleId, temp.requestedAmount, stubPayout)
+    await clearSession(whatsapp)
+
+    if (!result.success) {
+      return `Withdrawal could not be completed: ${result.reason}`
+    }
+
+    const cycleMsg = result.cycleEnded
+      ? `\n\nYour savings cycle has ended. Type 1 to start a new one whenever you are ready.`
+      : ''
+
+    return `N${result.netAmount.toLocaleString()} is on its way to your account.${cycleMsg}`
+  }
+
+  if (upper === 'NO' && step === 'awaiting_withdrawal_confirmation') {
+    await clearSession(whatsapp)
+    return `Withdrawal cancelled. Your savings are untouched.`
   }
 
   if (upper === 'FREEZE') {
@@ -376,7 +449,7 @@ async function handleMessage(from, body) {
   }
 
   if (upper === 'HELP') {
-    return `Temi Commands\n\nMENU - Return to main menu\nBALANCE - Check your savings\nSAVE TRF123 - Record your daily contribution\nFREEZE - Freeze your account\nHELP - Show this menu\n\nFor support contact hello@myajo.ng`
+    return `Temi Commands\n\nMENU - Return to main menu\nBALANCE - Check your savings\nSAVE TRF123 - Record your daily contribution\nWITHDRAW 5000 - Withdraw an amount from your savings (available from day 10)\nFREEZE - Freeze your account\nHELP - Show this menu\n\nWithdrawing before your 30 day cycle ends attracts a small charge from our banking partner (N50 up to N10,000, N100 above that). MyAjo never adds anything on top. Complete the full cycle and there is no charge at all.\n\nFor support contact hello@myajo.ng`
   }
 
   return `I did not understand that. Type MENU to see your options or HELP to see all commands.`
