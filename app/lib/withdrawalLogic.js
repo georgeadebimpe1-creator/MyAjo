@@ -77,7 +77,7 @@ export function quoteWithdrawal({ requestedAmount, daysContributed, withdrawable
   if (requestedAmount > withdrawableBalance) {
     return {
       allowed: false,
-      reason: `You can withdraw up to N${withdrawableBalance.toLocaleString()}. Day 1's contribution stays locked as MyAjo's commission and is not included.`,
+      reason: `You can withdraw up to N${withdrawableBalance.toLocaleString()} at this time.`,
     }
   }
 
