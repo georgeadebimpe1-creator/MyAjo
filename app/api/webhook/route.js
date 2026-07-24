@@ -1,56 +1,34 @@
 import { NextResponse } from 'next/server'
 import { supabase } from '../../lib/supabase'
-import twilio from 'twilio'
 import { quoteWithdrawalForCycle, processWithdrawal, stubPayout, getWithdrawableBalance } from '../../lib/withdrawal'
 
-const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
+// --- META WHATSAPP CLOUD API SETUP ---
+// These come from your Meta App dashboard (WhatsApp > API Setup)
+const META_TOKEN = process.env.META_WHATSAPP_TOKEN
+const META_PHONE_NUMBER_ID = process.env.META_PHONE_NUMBER_ID
+const META_VERIFY_TOKEN = process.env.META_VERIFY_TOKEN
+const META_API_URL = `https://graph.facebook.com/v20.0/${META_PHONE_NUMBER_ID}/messages`
 
+// Sends a WhatsApp message via Meta's Cloud API (replaces the old Twilio sendMessage)
 async function sendMessage(to, message) {
-  await client.messages.create({
-    from: process.env.TWILIO_WHATSAPP_NUMBER,
-    to,
-    body: message,
+  await fetch(META_API_URL, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${META_TOKEN}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      messaging_product: 'whatsapp',
+      to,
+      type: 'text',
+      text: { body: message },
+    }),
   })
 }
 
-async function getSession(whatsapp) {
-  const { data } = await supabase
-    .from('sessions')
-    .select('*')
-    .eq('whatsapp_number', whatsapp)
-    .single()
-  return data
-}
-
-async function updateSession(whatsapp, step, tempData = {}) {
-  const existing = await getSession(whatsapp)
-  if (existing) {
-    await supabase
-      .from('sessions')
-      .update({ step, temp_data: tempData, updated_at: new Date().toISOString() })
-      .eq('whatsapp_number', whatsapp)
-  } else {
-    await supabase
-      .from('sessions')
-      .insert([{ whatsapp_number: whatsapp, step, temp_data: tempData }])
-  }
-}
-
-async function clearSession(whatsapp) {
-  await supabase
-    .from('sessions')
-    .update({ step: 'welcome', temp_data: {} })
-    .eq('whatsapp_number', whatsapp)
-}
-
-function progressBar(days) {
-  const filled = Math.round((days / 30) * 10)
-  const empty = 10 - filled
-  return 'filled '.repeat(filled).trim().split(' ').join('') + 'empty '.repeat(empty).trim().split(' ').join('')
-}
-
 async function handleMessage(from, body) {
-  const whatsapp = from.replace('whatsapp:+234', '0').replace('whatsapp:+', '').replace('whatsapp:', '')
+  // Meta sends the number as plain digits, e.g. "2348012345678" (no "whatsapp:" prefix)
+  const whatsapp = from.startsWith('234') ? '0' + from.slice(3) : from
   const message = body.trim()
   const upper = message.toUpperCase()
 
@@ -125,12 +103,12 @@ async function handleMessage(from, body) {
 
     if (message === '3') {
       await clearSession(whatsapp)
-      return `How MyAjo Works\n\nMyAjo is a digital daily savings platform built on the trusted ajo tradition.\n\n1. You choose how much to save every day\n2. You save daily for 30 days\n3. At the end of 30 days you collect your full savings minus one day as MyAjo commission\n\nExample:\nSave N1,000 every day\nTotal after 30 days: N30,000\nMyAjo commission: N1,000 (one day)\nYou receive: N29,000\n\nNeed your money before 30 days? You can withdraw anytime after day 10 — a small fee from our banking partner applies (N50 for withdrawals up to N10,000, N100 above that). MyAjo never charges you extra for this.\n\nYour money is safe and held by our licensed banking partner.\n\nType 1 to start saving today.`
+      return `How MyAjo Works\n\nMyAjo is a digital daily savings platform built on the trusted ajo tradition.\n\n1. You choose how much to save every day\n2. You save daily for 30 days\n3. At the end of 30 days you collect your full savings minus MyAjo commission of 3%\n\nExample:\nSave N1,000 every day\nTotal after 30 days: N30,000\nMyAjo commission: N900 (one day)\nYou receive: N29,100\n\nNeed your money before 30 days? You can withdraw anytime after day 10 — a small fee from our banking partner applies (N50 for withdrawals up to N10,000, N100 above that). MyAjo never charges you extra for this.\n\nYour money is safe and held by our licensed banking partner.\n\nType 1 to start saving today.`
     }
 
     if (message === '4') {
       await clearSession(whatsapp)
-      return `Support\n\nTo speak with our support team please send an email to hello@myajo.ng or call 08029708278 during business hours Monday to Friday 8am to 6pm.\n\nType MENU to return to the main menu.`
+      return `Support\n\nTo speak with our support team please send an email to hello@myajo.com.ng or call 08029708278 during business hours Monday to Friday 8am to 5pm.\n\nType MENU to return to the main menu.`
     }
 
     return `Please reply with a number between 1 and 4 to choose an option.\n\n1. Start Daily Savings\n2. Check My Balance\n3. Learn How It Works\n4. Speak with Support`
@@ -157,7 +135,7 @@ async function handleMessage(from, body) {
   if (step === 'confirm_account') {
     if (message === '1') {
       await updateSession(whatsapp, 'get_amount', temp)
-      return `How much would you like to save every day?\n\nExamples:\n500\n1000\n2000\n5000\n\nReply with the amount in Naira.`
+      return `How much would you like to save every day?\n\nExamples:\n1000\n2000\n3000\n5000\n\nReply with the amount in Naira.`
     }
     if (message === '2') {
       await updateSession(whatsapp, 'get_bank', { full_name: temp.full_name })
@@ -169,7 +147,7 @@ async function handleMessage(from, body) {
   if (step === 'get_amount') {
     const amount = parseFloat(message)
     if (isNaN(amount) || amount < 200) {
-      return `The minimum daily savings amount is N200. Please enter a valid amount.`
+      return `The minimum daily savings amount is N1000. Please enter a valid amount.`
     }
     if (amount > 50000) {
       return `The maximum daily savings amount is N50,000. Please enter a lower amount.`
@@ -319,7 +297,7 @@ async function handleMessage(from, body) {
       const result = await processWithdrawal(cycle.id, withdrawableBalance, stubPayout)
 
       if (!result.success) {
-        return `Congratulations ${user.full_name}!\n\nYou have completed your 30 day savings plan, but your payout could not be processed automatically (${result.reason}).\n\nPlease contact support at hello@myajo.ng and we will resolve this right away.`
+        return `Congratulations ${user.full_name}!\n\nYou have completed your 30 day savings plan, but your payout could not be processed automatically (${result.reason}).\n\nPlease contact support at hello@myajo.com.ng and we will resolve this right away.`
       }
 
       return `Congratulations ${user.full_name}!\n\nYou have completed your 30 day savings plan!\n\nTotal saved: N${newTotal.toLocaleString()}\nMyAjo commission: N${commission.toLocaleString()} (one day)\nYour payout: N${result.netAmount.toLocaleString()}\n\nYour payout is being sent to your ${cycle.bank_name || 'registered'} account. We will notify you once it has been sent.\n\nThank you for saving with MyAjo. Would you like to start another cycle? Type 1 to begin.`
@@ -455,20 +433,42 @@ async function handleMessage(from, body) {
   return `I did not understand that. Type MENU to see your options or HELP to see all commands.`
 }
 
+// --- WEBHOOK VERIFICATION (Meta calls this once when you connect the webhook) ---
+export async function GET(request) {
+  const { searchParams } = new URL(request.url)
+  const mode = searchParams.get('hub.mode')
+  const token = searchParams.get('hub.verify_token')
+  const challenge = searchParams.get('hub.challenge')
+
+  if (mode === 'subscribe' && token === META_VERIFY_TOKEN) {
+    return new NextResponse(challenge, { status: 200 })
+  }
+  return new NextResponse('Verification failed', { status: 403 })
+}
+
+// --- INCOMING MESSAGES (Meta calls this every time a trader messages Temi) ---
 export async function POST(request) {
   try {
-    const formData = await request.formData()
-    const from = formData.get('From')
-    const body = formData.get('Body')
+    const payload = await request.json()
 
-    const response = await handleMessage(from, body)
+    const entry = payload.entry?.[0]
+    const change = entry?.changes?.[0]
+    const message = change?.value?.messages?.[0]
 
-    const twiml = `<?xml version="1.0" encoding="UTF-8"?><Response><Message>${response}</Message></Response>`
+    // Meta also sends "status" updates (delivered/read) through this same endpoint.
+    // We only want to react to actual incoming text messages, so we quietly
+    // acknowledge anything else and stop.
+    if (!message || message.type !== 'text') {
+      return new NextResponse('OK', { status: 200 })
+    }
 
-    return new NextResponse(twiml, {
-      status: 200,
-      headers: { 'Content-Type': 'text/xml' },
-    })
+    const from = message.from
+    const body = message.text.body
+
+    const responseText = await handleMessage(from, body)
+    await sendMessage(from, responseText)
+
+    return new NextResponse('OK', { status: 200 })
   } catch (error) {
     console.error('Webhook error:', error)
     return new NextResponse('Error', { status: 500 })
