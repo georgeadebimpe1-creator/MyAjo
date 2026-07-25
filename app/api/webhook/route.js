@@ -33,6 +33,35 @@ async function sendMessage(to, message) {
 // instead of being written out separately in different places (which is what
 // caused the mismatch between the example text and the actual charge before).
 const COMMISSION_RATE = 0.03
+async function getSession(whatsapp) {
+  const { data } = await supabase
+    .from('sessions')
+    .select('*')
+    .eq('whatsapp_number', whatsapp)
+    .single()
+  return data
+}
+
+async function updateSession(whatsapp, step, tempData = {}) {
+  const existing = await getSession(whatsapp)
+  if (existing) {
+    await supabase
+      .from('sessions')
+      .update({ step, temp_data: tempData, updated_at: new Date().toISOString() })
+      .eq('whatsapp_number', whatsapp)
+  } else {
+    await supabase
+      .from('sessions')
+      .insert([{ whatsapp_number: whatsapp, step, temp_data: tempData }])
+  }
+}
+
+async function clearSession(whatsapp) {
+  await supabase
+    .from('sessions')
+    .update({ step: 'welcome', temp_data: {} })
+    .eq('whatsapp_number', whatsapp)
+}
 
 async function handleMessage(from, body) {
   // Meta sends the number as plain digits, e.g. "2348012345678" (no "whatsapp:" prefix)
