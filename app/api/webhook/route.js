@@ -3,7 +3,9 @@ import { supabase } from '../../lib/supabase'
 import { quoteWithdrawalForCycle, processWithdrawal, stubPayout, getWithdrawableBalance } from '../../lib/withdrawal'
 
 // --- META WHATSAPP CLOUD API SETUP ---
-// These come from your Meta App dashboard (WhatsApp > API Setup)
+// These read the actual values from Vercel's Environment Variables page.
+// Never put your real token, phone number ID, or verify token directly here —
+// only the variable NAMES belong in this file.
 const META_TOKEN = process.env.META_WHATSAPP_TOKEN
 const META_PHONE_NUMBER_ID = process.env.META_PHONE_NUMBER_ID
 const META_VERIFY_TOKEN = process.env.META_VERIFY_TOKEN
@@ -25,6 +27,12 @@ async function sendMessage(to, message) {
     }),
   })
 }
+
+// Commission rate: 3% of total 30-day savings.
+// Kept as one constant so the SAME number is used everywhere it's calculated,
+// instead of being written out separately in different places (which is what
+// caused the mismatch between the example text and the actual charge before).
+const COMMISSION_RATE = 0.03
 
 async function handleMessage(from, body) {
   // Meta sends the number as plain digits, e.g. "2348012345678" (no "whatsapp:" prefix)
@@ -103,7 +111,7 @@ async function handleMessage(from, body) {
 
     if (message === '3') {
       await clearSession(whatsapp)
-      return `How MyAjo Works\n\nMyAjo is a digital daily savings platform built on the trusted ajo tradition.\n\n1. You choose how much to save every day\n2. You save daily for 30 days\n3. At the end of 30 days you collect your full savings minus MyAjo commission of 3%\n\nExample:\nSave N1,000 every day\nTotal after 30 days: N30,000\nMyAjo commission: N900 (one day)\nYou receive: N29,100\n\nNeed your money before 30 days? You can withdraw anytime after day 10 — a small fee from our banking partner applies (N50 for withdrawals up to N10,000, N100 above that). MyAjo never charges you extra for this.\n\nYour money is safe and held by our licensed banking partner.\n\nType 1 to start saving today.`
+      return `How MyAjo Works\n\nMyAjo is a digital daily savings platform built on the trusted ajo tradition.\n\n1. You choose how much to save every day\n2. You save daily for 30 days\n3. At the end of 30 days you collect your full savings minus MyAjo commission of 3%\n\nExample:\nSave N1,000 every day\nTotal after 30 days: N30,000\nMyAjo commission: N900 (3%)\nYou receive: N29,100\n\nNeed your money before 30 days? You can withdraw anytime after day 10 — a small fee from our banking partner applies (N50 for withdrawals up to N10,000, N100 above that). MyAjo never charges you extra for this.\n\nYour money is safe and held by our licensed banking partner.\n\nType 1 to start saving today.`
     }
 
     if (message === '4') {
@@ -153,12 +161,12 @@ async function handleMessage(from, body) {
       return `The maximum daily savings amount is N50,000. Please enter a lower amount.`
     }
 
-    const commission = amount
     const totalSavings = amount * 30
+    const commission = Math.round(totalSavings * COMMISSION_RATE)
     const payout = totalSavings - commission
 
     await updateSession(whatsapp, 'confirm_plan', { ...temp, daily_amount: amount })
-    return `Your Savings Plan\n\nDaily amount: N${amount.toLocaleString()}\nDuration: 30 days\nTotal savings: N${totalSavings.toLocaleString()}\nMyAjo commission: N${commission.toLocaleString()} (one day)\nYou will receive: N${payout.toLocaleString()}\n\nYour payout goes to:\n${temp.bank_name} - ${temp.bank_account_number}\n\nType CONFIRM to activate your savings plan or CANCEL to start over.`
+    return `Your Savings Plan\n\nDaily amount: N${amount.toLocaleString()}\nDuration: 30 days\nTotal savings: N${totalSavings.toLocaleString()}\nMyAjo commission: N${commission.toLocaleString()} (3%)\nYou will receive: N${payout.toLocaleString()}\n\nYour payout goes to:\n${temp.bank_name} - ${temp.bank_account_number}\n\nType CONFIRM to activate your savings plan or CANCEL to start over.`
   }
 
   if (step === 'confirm_plan') {
@@ -198,12 +206,15 @@ async function handleMessage(from, body) {
         userId = newUser.id
       }
 
+      const totalSavings = temp.daily_amount * 30
+      const commission = Math.round(totalSavings * COMMISSION_RATE)
+
       await supabase
         .from('cycles')
         .insert([{
           user_id: userId,
           daily_amount: temp.daily_amount,
-          commission: temp.daily_amount,
+          commission: commission,
           status: 'active',
           start_date: new Date().toISOString().split('T')[0],
         }])
@@ -300,7 +311,7 @@ async function handleMessage(from, body) {
         return `Congratulations ${user.full_name}!\n\nYou have completed your 30 day savings plan, but your payout could not be processed automatically (${result.reason}).\n\nPlease contact support at hello@myajo.com.ng and we will resolve this right away.`
       }
 
-      return `Congratulations ${user.full_name}!\n\nYou have completed your 30 day savings plan!\n\nTotal saved: N${newTotal.toLocaleString()}\nMyAjo commission: N${commission.toLocaleString()} (one day)\nYour payout: N${result.netAmount.toLocaleString()}\n\nYour payout is being sent to your ${cycle.bank_name || 'registered'} account. We will notify you once it has been sent.\n\nThank you for saving with MyAjo. Would you like to start another cycle? Type 1 to begin.`
+      return `Congratulations ${user.full_name}!\n\nYou have completed your 30 day savings plan!\n\nTotal saved: N${newTotal.toLocaleString()}\nMyAjo commission: N${commission.toLocaleString()} (3%)\nYour payout: N${result.netAmount.toLocaleString()}\n\nYour payout is being sent to your ${cycle.bank_name || 'registered'} account. We will notify you once it has been sent.\n\nThank you for saving with MyAjo. Would you like to start another cycle? Type 1 to begin.`
     }
 
     const filled = Math.round((newDays / 30) * 10)
