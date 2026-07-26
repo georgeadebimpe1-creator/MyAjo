@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState, Suspense } from 'react'
+import { useState, Suspense } from 'react'
 import { useSearchParams } from 'next/navigation'
 import Script from 'next/script'
 
@@ -13,8 +13,14 @@ function VerifyContent() {
   const whatsapp = searchParams.get('ref') // trader's WhatsApp number, passed in the link
   const [status, setStatus] = useState('loading') // loading, ready, success, error
 
-  useEffect(() => {
-    if (typeof window === 'undefined' || !window.Connect) return
+  // This only runs once Dojah's script has actually finished loading —
+  // fixes the earlier version, which tried to open the widget immediately
+  // and silently failed if the script wasn't ready yet.
+  function openWidget() {
+    if (typeof window === 'undefined' || !window.Connect) {
+      setStatus('error')
+      return
+    }
 
     const options = {
       app_id: process.env.NEXT_PUBLIC_DOJAH_APP_ID,
@@ -42,7 +48,7 @@ function VerifyContent() {
     connect.setup()
     connect.open()
     setStatus('ready')
-  }, [whatsapp])
+  }
 
   if (!whatsapp) {
     return (
@@ -54,7 +60,12 @@ function VerifyContent() {
 
   return (
     <div style={{ padding: 40, textAlign: 'center', fontFamily: 'Arial' }}>
-      <Script src="https://widget.dojah.io/widget.js" strategy="afterInteractive" />
+      <Script
+        src="https://widget.dojah.io/widget.js"
+        strategy="afterInteractive"
+        onLoad={openWidget}
+        onError={() => setStatus('error')}
+      />
       {status === 'loading' && <p>Loading verification...</p>}
       {status === 'success' && (
         <div>
@@ -65,7 +76,7 @@ function VerifyContent() {
       {status === 'error' && (
         <div>
           <h2>Something went wrong</h2>
-          <p>Please try again, or go back to WhatsApp and type DONE and Temi will let you know if it's still processing.</p>
+          <p>Please refresh this page and try again, or go back to WhatsApp, type DONE, and Temi will let you know if it's still processing.</p>
         </div>
       )}
     </div>
