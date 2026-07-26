@@ -10,6 +10,7 @@ const META_TOKEN = process.env.META_WHATSAPP_TOKEN
 const META_PHONE_NUMBER_ID = process.env.META_PHONE_NUMBER_ID
 const META_VERIFY_TOKEN = process.env.META_VERIFY_TOKEN
 const META_API_URL = `https://graph.facebook.com/v20.0/${META_PHONE_NUMBER_ID}/messages`
+const APP_URL = process.env.APP_URL || 'https://my-ajo-ten.vercel.app'
 
 // Sends a WhatsApp message via Meta's Cloud API (replaces the old Twilio sendMessage)
 async function sendMessage(to, message) {
@@ -160,8 +161,41 @@ async function handleMessage(from, body) {
   }
 
   if (step === 'get_name') {
-    await updateSession(whatsapp, 'get_bank', { ...temp, full_name: message })
-    return `Nice to meet you ${message}.\n\nWe will use your WhatsApp number as your savings account number so no extra registration is needed.\n\nWhich bank would you like your payout sent to?`
+    const verifyLink = `${APP_URL}/verify?ref=${whatsapp}`
+    await updateSession(whatsapp, 'awaiting_verification', { ...temp, full_name: message })
+    return `Nice to meet you ${message}.\n\nTo keep your money safe, please verify your identity here:\n${verifyLink}\n\nIt takes about a minute. Once you're done, come back here and type DONE.`
+  }
+
+  if (step === 'awaiting_verification') {
+    if (upper === 'DONE') {
+      const { data: user } = await supabase
+        .from('users')
+        .select('kyc_status')
+        .eq('whatsapp_number', whatsapp)
+        .single()
+
+      if (user && user.kyc_status === 'verified') {
+        await updateSession(whatsapp, 'get_email', temp)
+        return `You're verified! Just one more thing — what's your email address?`
+      }
+
+      if (user && user.kyc_status === 'failed') {
+        const verifyLink = `${APP_URL}/verify?ref=${whatsapp}`
+        return `Hmm, we couldn't verify your details. This usually happens if the photo was blurry or didn't match your BVN.\n\nPlease try again here: ${verifyLink}\n\nThen type DONE.`
+      }
+
+      return `Still checking your details, this usually takes just a moment. Please type DONE again in a minute.`
+    }
+
+    return `Please complete your verification using the link above, then type DONE.`
+  }
+
+  if (step === 'get_email') {
+    if (!message.includes('@') || !message.includes('.')) {
+      return `That doesn't look like a valid email address. Please try again.`
+    }
+    await updateSession(whatsapp, 'get_bank', { ...temp, email: message })
+    return `Got it. We will use your WhatsApp number as your savings account number so no extra registration is needed.\n\nWhich bank would you like your payout sent to?`
   }
 
   if (step === 'get_bank') {
@@ -222,6 +256,7 @@ async function handleMessage(from, body) {
           .from('users')
           .update({
             full_name: temp.full_name,
+            email: temp.email,
             bank_name: temp.bank_name,
             bank_account_number: temp.bank_account_number,
           })
@@ -233,6 +268,7 @@ async function handleMessage(from, body) {
             full_name: temp.full_name,
             phone_number: whatsapp,
             whatsapp_number: whatsapp,
+            email: temp.email,
             bank_name: temp.bank_name,
             bank_account_number: temp.bank_account_number,
             bank_account_name: temp.full_name,
