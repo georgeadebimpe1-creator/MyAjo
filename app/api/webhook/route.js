@@ -225,7 +225,7 @@ async function handleMessage(from, body) {
 
   if (step === 'get_amount') {
     const amount = parseFloat(message)
-    if (isNaN(amount) || amount < 200) {
+    if (isNaN(amount) || amount < 1000) {
       return `The minimum daily savings amount is N1000. Please enter a valid amount.`
     }
     if (amount > 50000) {
