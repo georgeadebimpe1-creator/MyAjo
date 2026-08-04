@@ -231,7 +231,6 @@ async function handleMessage(from, body) {
     if (amount > 450000) {
   return `For daily amounts above N450,000, please contact our support team directly at hello@myajo.com.ng so we can set this up for you.`
 }
-    }
 
     const totalSavings = amount * 30
     const commission = Math.round(totalSavings * COMMISSION_RATE)
