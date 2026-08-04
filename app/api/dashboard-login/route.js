@@ -10,7 +10,7 @@ export async function POST(request) {
   const response = new NextResponse('OK', { status: 200 })
   // httpOnly means this cookie can't be read or stolen via JavaScript in the
   // browser — a meaningful step up in safety over a plain client-side check.
-  response.cookies.set('myajo_dashboard_auth', password, {
+ response.cookies.set('myajo_dashboard_auth', 'authenticated', {
     httpOnly: true,
     secure: true,
     sameSite: 'strict',
