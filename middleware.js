@@ -6,7 +6,7 @@ import { NextResponse } from 'next/server'
 export function middleware(request) {
   const authCookie = request.cookies.get('myajo_dashboard_auth')
 
-  if (authCookie?.value === process.env.DASHBOARD_PASSWORD) {
+  if (authCookie?.value === 'authenticated') {
     return NextResponse.next()
   }
 
@@ -15,5 +15,5 @@ export function middleware(request) {
 }
 
 export const config = {
-  matcher: '/dashboard',
+  matcher:['/dashboard', '/dashboard/:path*'],
 }
