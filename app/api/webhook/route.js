@@ -1,34 +1,11 @@
 import { NextResponse } from 'next/server'
 import { supabase } from '../../lib/supabase'
+import { sendMessage } from '../../lib/whatsapp'
+import { getMessage } from '../../lib/messages'
 import { quoteWithdrawalForCycle, processWithdrawal, stubPayout, getWithdrawableBalance } from '../../lib/withdrawal'
-import { getMessage, LANGUAGES, LANGUAGE_SELECT_MESSAGE } from '../../lib/messages'
 
-const META_TOKEN = process.env.META_WHATSAPP_TOKEN
-const META_PHONE_NUMBER_ID = process.env.META_PHONE_NUMBER_ID
 const META_VERIFY_TOKEN = process.env.META_VERIFY_TOKEN
-const META_API_URL = `https://graph.facebook.com/v20.0/${META_PHONE_NUMBER_ID}/messages`
 const APP_URL = process.env.APP_URL || 'https://my-ajo-ten.vercel.app'
-
-async function sendMessage(to, message) {
-  const response = await fetch(META_API_URL, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${META_TOKEN}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      messaging_product: 'whatsapp',
-      to,
-      type: 'text',
-      text: { body: message },
-    }),
-  })
-
-  if (!response.ok) {
-    const errorBody = await response.text()
-    console.error('Meta send failed:', response.status, errorBody)
-  }
-}
 
 const COMMISSION_RATE = 0.03
 
@@ -72,31 +49,8 @@ async function handleMessage(from, body) {
   const temp = session ? session.temp_data : {}
 
   if (upper === 'MENU' || upper === 'START' || upper === 'HI' || upper === 'HELLO' || !session) {
-    const { data: existingUser } = await supabase
-      .from('users')
-      .select('id, language')
-      .eq('whatsapp_number', whatsapp)
-      .single()
-
-    if (!existingUser && !session) {
-      await updateSession(whatsapp, 'select_language', {})
-      return LANGUAGE_SELECT_MESSAGE
-    }
-
-    const lang = existingUser?.language || temp?.language || 'en'
-    await updateSession(whatsapp, 'main_menu', { language: lang })
-    return getMessage('welcome', lang)
-  }
-
-  if (step === 'select_language') {
-    const chosenLang = LANGUAGES[message]
-
-    if (!chosenLang) {
-      return LANGUAGE_SELECT_MESSAGE
-    }
-
-    await updateSession(whatsapp, 'main_menu', { language: chosenLang })
-    return getMessage('welcome', chosenLang)
+    await updateSession(whatsapp, 'main_menu', {})
+    return `Welcome to MyAjo. I am Temi, your personal savings assistant.\n\nI am here to help you build a consistent daily savings habit.\n\nPlease choose an option:\n\n1. Start Daily Savings\n2. Check My Balance\n3. Learn How It Works\n4. Speak with Support\n\nReply with a number.`
   }
 
   if (step === 'main_menu') {
@@ -117,11 +71,11 @@ async function handleMessage(from, body) {
 
         if (activeCycle) {
           await clearSession(whatsapp)
-          return `You already have an active savings cycle running.\n\nType BALANCE to check your savings, SAVE followed by your reference to record today's contribution, or WITHDRAW followed by an amount to withdraw.`
+          return `You already have an active savings cycle running.\n\nType BALANCE to check your savings, PAID to confirm today's transfer, or WITHDRAW followed by an amount to withdraw.`
         }
       }
 
-      await updateSession(whatsapp, 'get_name', { language: temp.language })
+      await updateSession(whatsapp, 'get_name', {})
       return `Great! Let us create your savings plan.\n\nWhat is your full name?`
     }
 
@@ -271,7 +225,6 @@ async function handleMessage(from, body) {
             email: temp.email,
             bank_name: temp.bank_name,
             bank_account_number: temp.bank_account_number,
-            language: temp.language || 'en',
           })
           .eq('id', userId)
       } else {
@@ -286,7 +239,6 @@ async function handleMessage(from, body) {
             bank_account_number: temp.bank_account_number,
             bank_account_name: temp.full_name,
             status: 'active',
-            language: temp.language || 'en',
           }])
           .select()
           .single()
@@ -307,7 +259,7 @@ async function handleMessage(from, body) {
         }])
 
       await clearSession(whatsapp)
-      return `Your savings plan is now active!\n\n${temp.full_name} your MyAjo journey has begun.\n\nRemember to save N${parseFloat(temp.daily_amount).toLocaleString()} every day for 30 days.\n\nTo record your daily contribution send:\nSAVE followed by your bank transfer reference\n\nExample: SAVE TRF20240707001234\n\nGood luck and stay consistent!`
+      return `Your savings plan is now active!\n\n${temp.full_name} your MyAjo journey has begun.\n\nRemember to save N${parseFloat(temp.daily_amount).toLocaleString()} every day for 30 days.\n\nWhen your transfer goes through, we will confirm it automatically. You can also type PAID anytime to check.\n\nGood luck and stay consistent!`
     }
 
     if (upper === 'CANCEL') {
@@ -318,14 +270,12 @@ async function handleMessage(from, body) {
     return `Please type CONFIRM to activate your plan or CANCEL to start over.`
   }
 
-  if (upper.startsWith('SAVE')) {
-    const parts = body.trim().split(' ')
-    const reference = parts[1]
-
-    if (!reference) {
-      return `To record your contribution please include your bank transfer reference.\n\nExample: SAVE TRF20240707001234`
-    }
-
+  // PAID — checks whether today's contribution has already been
+  // confirmed by the Anchor deposit webhook. This does NOT record a
+  // contribution itself; only a real, bank-confirmed deposit does that.
+  // Letting a typed word insert a contribution directly would let
+  // anyone claim credit for a transfer they never made.
+  if (upper === 'PAID') {
     const { data: user } = await supabase
       .from('users')
       .select('id, full_name')
@@ -338,7 +288,7 @@ async function handleMessage(from, body) {
 
     const { data: cycle } = await supabase
       .from('cycles')
-      .select('id, daily_amount, days_contributed, total_saved, commission, bank_name, partial_withdrawals')
+      .select('id, daily_amount, days_contributed, total_saved')
       .eq('user_id', user.id)
       .eq('status', 'active')
       .single()
@@ -348,65 +298,35 @@ async function handleMessage(from, body) {
     }
 
     const today = new Date().toISOString().split('T')[0]
-    const { data: alreadyPaid } = await supabase
+    const { data: paidToday } = await supabase
       .from('contributions')
       .select('id')
       .eq('cycle_id', cycle.id)
       .eq('contribution_date', today)
       .single()
 
-    if (alreadyPaid) {
-      return `You have already recorded your contribution for today. Well done ${user.full_name}!\n\nType BALANCE to see your savings.`
+    if (paidToday) {
+      const daysRemaining = 30 - cycle.days_contributed
+      return getMessage('contribution_recorded', 'en', {
+        amount: parseFloat(cycle.daily_amount).toLocaleString(),
+        dayNumber: cycle.days_contributed,
+        totalSaved: parseFloat(cycle.total_saved).toLocaleString(),
+        daysRemaining,
+      })
     }
 
-    const { error } = await supabase
-      .from('contributions')
-      .insert([{
-        cycle_id: cycle.id,
-        user_id: user.id,
-        amount: cycle.daily_amount,
-        contribution_date: today,
-        payment_reference: reference,
-        verified: false,
-        contribution_type: 'daily',
-      }])
+    return `We haven't received your transfer yet. Bank transfers can take a few minutes to reflect — Temi will confirm automatically as soon as it comes in. If it's been more than 30 minutes, type HELP to contact support.`
+  }
 
-    if (error) {
-      return `Sorry I could not record your contribution right now. Please try again.`
-    }
-
-    const newDays = cycle.days_contributed + 1
-    const newTotal = parseFloat(cycle.total_saved) + parseFloat(cycle.daily_amount)
-    const commission = parseFloat(cycle.commission)
-    const daysRemaining = 30 - newDays
-
-    await supabase
-      .from('cycles')
-      .update({ days_contributed: newDays, total_saved: newTotal })
-      .eq('id', cycle.id)
-
-    if (newDays === 30) {
-      const updatedCycle = { ...cycle, days_contributed: newDays, total_saved: newTotal }
-      const withdrawableBalance = await getWithdrawableBalance(updatedCycle)
-      const result = await processWithdrawal(cycle.id, withdrawableBalance, stubPayout)
-
-      if (!result.success) {
-        return `Congratulations ${user.full_name}!\n\nYou have completed your 30 day savings plan, but your payout could not be processed automatically (${result.reason}).\n\nPlease contact support at hello@myajo.com.ng and we will resolve this right away.`
-      }
-
-      return `Congratulations ${user.full_name}!\n\nYou have completed your 30 day savings plan!\n\nTotal saved: N${newTotal.toLocaleString()}\nMyAjo commission: N${commission.toLocaleString()} (3%)\nYour payout: N${result.netAmount.toLocaleString()}\n\nYour payout is being sent to your ${cycle.bank_name || 'registered'} account. We will notify you once it has been sent.\n\nThank you for saving with MyAjo. Would you like to start another cycle? Type 1 to begin.`
-    }
-
-    const filled = Math.round((newDays / 30) * 10)
-    const progressDisplay = '[' + '#'.repeat(filled) + '-'.repeat(10 - filled) + ']'
-
-    return `Payment received ${user.full_name}!\n\nDay ${newDays} of 30 recorded.\n\nProgress: ${progressDisplay} ${Math.round((newDays / 30) * 100)}%\n\nYou have saved: N${newTotal.toLocaleString()}\nDays remaining: ${daysRemaining}\n\n${daysRemaining <= 5 ? 'You are almost there! Keep going!' : 'Stay consistent. Every day counts!'}${newDays === 10 ? '\n\nYou can now withdraw anytime you like if you need to. Type HELP to see how withdrawals work.' : ''}`
+  // Redirect anyone still typing the old SAVE command.
+  if (upper.startsWith('SAVE')) {
+    return `We've simplified this — you no longer need to send a reference number. Just make your transfer, then reply PAID and Temi will confirm it for you.`
   }
 
   if (upper === 'BALANCE') {
     const { data: user } = await supabase
       .from('users')
-      .select('id, full_name, language')
+      .select('id, full_name')
       .eq('whatsapp_number', whatsapp)
       .single()
 
@@ -435,17 +355,7 @@ async function handleMessage(from, body) {
       ? `\n\nYou can withdraw anytime. Type WITHDRAW followed by an amount.`
       : `\n\nWithdrawals unlock on day 10 (${10 - cycle.days_contributed} day${10 - cycle.days_contributed === 1 ? '' : 's'} to go).`
 
-    return getMessage('balance', user.language, {
-      name: user.full_name,
-      saved: parseFloat(cycle.total_saved).toLocaleString(),
-      daysContributed: cycle.days_contributed,
-      progressBar: progressDisplay,
-      progressPercent: Math.round((cycle.days_contributed / 30) * 100),
-      expectedTotal: expectedTotal.toLocaleString(),
-      commission: commission.toLocaleString(),
-      expectedPayout: expectedPayout.toLocaleString(),
-      withdrawLine,
-    })
+    return `Your Savings\n\nHello ${user.full_name}\n\nSaved: N${parseFloat(cycle.total_saved).toLocaleString()}\nDays completed: ${cycle.days_contributed} of 30\n\nProgress: ${progressDisplay} ${Math.round((cycle.days_contributed / 30) * 100)}%\n\nExpected total: N${expectedTotal.toLocaleString()}\nMyAjo commission: N${commission.toLocaleString()}\nYour payout: N${expectedPayout.toLocaleString()}${withdrawLine}\n\nKeep saving every day!`
   }
 
   if (upper.startsWith('WITHDRAW')) {
@@ -531,13 +441,7 @@ async function handleMessage(from, body) {
   }
 
   if (upper === 'HELP') {
-    const { data: user } = await supabase
-      .from('users')
-      .select('language')
-      .eq('whatsapp_number', whatsapp)
-      .single()
-
-    return getMessage('help', user?.language || 'en')
+    return `Temi Commands\n\nMENU - Return to main menu\nBALANCE - Check your savings\nPAID - Confirm today's transfer has gone through\nWITHDRAW 5000 - Withdraw an amount from your savings (available from day 10)\nFREEZE - Freeze your account\nHELP - Show this menu\n\nWithdrawing before your 30 day cycle ends attracts a small charge from our banking partner (N50 up to N10,000, N100 above that). MyAjo never adds anything on top. Complete the full cycle and there is no charge at all.\n\nFor support contact hello@myajo.ng`
   }
 
   return `I did not understand that. Type MENU to see your options or HELP to see all commands.`
