@@ -1,18 +1,14 @@
 import { NextResponse } from 'next/server'
 import { supabase } from '../../lib/supabase'
 import { quoteWithdrawalForCycle, processWithdrawal, stubPayout, getWithdrawableBalance } from '../../lib/withdrawal'
+import { getMessage, LANGUAGES, LANGUAGE_SELECT_MESSAGE } from '../../lib/messages'
 
-// --- META WHATSAPP CLOUD API SETUP ---
-// These read the actual values from Vercel's Environment Variables page.
-// Never put your real token, phone number ID, or verify token directly here —
-// only the variable NAMES belong in this file.
 const META_TOKEN = process.env.META_WHATSAPP_TOKEN
 const META_PHONE_NUMBER_ID = process.env.META_PHONE_NUMBER_ID
 const META_VERIFY_TOKEN = process.env.META_VERIFY_TOKEN
 const META_API_URL = `https://graph.facebook.com/v20.0/${META_PHONE_NUMBER_ID}/messages`
 const APP_URL = process.env.APP_URL || 'https://my-ajo-ten.vercel.app'
 
-// Sends a WhatsApp message via Meta's Cloud API (replaces the old Twilio sendMessage)
 async function sendMessage(to, message) {
   const response = await fetch(META_API_URL, {
     method: 'POST',
@@ -28,18 +24,12 @@ async function sendMessage(to, message) {
     }),
   })
 
-  // If Meta rejects the message (bad token, unverified recipient, etc.)
-  // this logs the exact reason instead of failing silently.
   if (!response.ok) {
     const errorBody = await response.text()
     console.error('Meta send failed:', response.status, errorBody)
   }
 }
 
-// Commission rate: 3% of total 30-day savings.
-// Kept as one constant so the SAME number is used everywhere it's calculated,
-// instead of being written out separately in different places (which is what
-// caused the mismatch between the example text and the actual charge before).
 const COMMISSION_RATE = 0.03
 
 async function getSession(whatsapp) {
@@ -73,7 +63,6 @@ async function clearSession(whatsapp) {
 }
 
 async function handleMessage(from, body) {
-  // Meta sends the number as plain digits, e.g. "2348012345678" (no "whatsapp:" prefix)
   const whatsapp = from.startsWith('234') ? '0' + from.slice(3) : from
   const message = body.trim()
   const upper = message.toUpperCase()
@@ -83,8 +72,31 @@ async function handleMessage(from, body) {
   const temp = session ? session.temp_data : {}
 
   if (upper === 'MENU' || upper === 'START' || upper === 'HI' || upper === 'HELLO' || !session) {
-    await updateSession(whatsapp, 'main_menu', {})
-    return `Welcome to MyAjo. I am Temi, your personal savings assistant.\n\nI am here to help you build a consistent daily savings habit.\n\nPlease choose an option:\n\n1. Start Daily Savings\n2. Check My Balance\n3. Learn How It Works\n4. Speak with Support\n\nReply with a number.`
+    const { data: existingUser } = await supabase
+      .from('users')
+      .select('id, language')
+      .eq('whatsapp_number', whatsapp)
+      .single()
+
+    if (!existingUser && !session) {
+      await updateSession(whatsapp, 'select_language', {})
+      return LANGUAGE_SELECT_MESSAGE
+    }
+
+    const lang = existingUser?.language || temp?.language || 'en'
+    await updateSession(whatsapp, 'main_menu', { language: lang })
+    return getMessage('welcome', lang)
+  }
+
+  if (step === 'select_language') {
+    const chosenLang = LANGUAGES[message]
+
+    if (!chosenLang) {
+      return LANGUAGE_SELECT_MESSAGE
+    }
+
+    await updateSession(whatsapp, 'main_menu', { language: chosenLang })
+    return getMessage('welcome', chosenLang)
   }
 
   if (step === 'main_menu') {
@@ -109,7 +121,7 @@ async function handleMessage(from, body) {
         }
       }
 
-      await updateSession(whatsapp, 'get_name', {})
+      await updateSession(whatsapp, 'get_name', { language: temp.language })
       return `Great! Let us create your savings plan.\n\nWhat is your full name?`
     }
 
@@ -229,8 +241,8 @@ async function handleMessage(from, body) {
       return `The minimum daily savings amount is N1000. Please enter a valid amount.`
     }
     if (amount > 450000) {
-  return `For daily amounts above N450,000, please contact our support team directly at hello@myajo.com.ng so we can set this up for you.`
-}
+      return `For daily amounts above N450,000, please contact our support team directly at hello@myajo.com.ng so we can set this up for you.`
+    }
 
     const totalSavings = amount * 30
     const commission = Math.round(totalSavings * COMMISSION_RATE)
@@ -259,6 +271,7 @@ async function handleMessage(from, body) {
             email: temp.email,
             bank_name: temp.bank_name,
             bank_account_number: temp.bank_account_number,
+            language: temp.language || 'en',
           })
           .eq('id', userId)
       } else {
@@ -273,6 +286,7 @@ async function handleMessage(from, body) {
             bank_account_number: temp.bank_account_number,
             bank_account_name: temp.full_name,
             status: 'active',
+            language: temp.language || 'en',
           }])
           .select()
           .single()
@@ -372,10 +386,6 @@ async function handleMessage(from, body) {
       .eq('id', cycle.id)
 
     if (newDays === 30) {
-      // Full cycle completed, no early withdrawal taken along the way.
-      // Route the payout through the same withdrawal engine used for
-      // WITHDRAW, so there is one single source of truth for the money
-      // math rather than duplicating it here.
       const updatedCycle = { ...cycle, days_contributed: newDays, total_saved: newTotal }
       const withdrawableBalance = await getWithdrawableBalance(updatedCycle)
       const result = await processWithdrawal(cycle.id, withdrawableBalance, stubPayout)
@@ -396,7 +406,7 @@ async function handleMessage(from, body) {
   if (upper === 'BALANCE') {
     const { data: user } = await supabase
       .from('users')
-      .select('id, full_name')
+      .select('id, full_name, language')
       .eq('whatsapp_number', whatsapp)
       .single()
 
@@ -425,7 +435,17 @@ async function handleMessage(from, body) {
       ? `\n\nYou can withdraw anytime. Type WITHDRAW followed by an amount.`
       : `\n\nWithdrawals unlock on day 10 (${10 - cycle.days_contributed} day${10 - cycle.days_contributed === 1 ? '' : 's'} to go).`
 
-    return `Your Savings\n\nHello ${user.full_name}\n\nSaved: N${parseFloat(cycle.total_saved).toLocaleString()}\nDays completed: ${cycle.days_contributed} of 30\n\nProgress: ${progressDisplay} ${Math.round((cycle.days_contributed / 30) * 100)}%\n\nExpected total: N${expectedTotal.toLocaleString()}\nMyAjo commission: N${commission.toLocaleString()}\nYour payout: N${expectedPayout.toLocaleString()}${withdrawLine}\n\nKeep saving every day!`
+    return getMessage('balance', user.language, {
+      name: user.full_name,
+      saved: parseFloat(cycle.total_saved).toLocaleString(),
+      daysContributed: cycle.days_contributed,
+      progressBar: progressDisplay,
+      progressPercent: Math.round((cycle.days_contributed / 30) * 100),
+      expectedTotal: expectedTotal.toLocaleString(),
+      commission: commission.toLocaleString(),
+      expectedPayout: expectedPayout.toLocaleString(),
+      withdrawLine,
+    })
   }
 
   if (upper.startsWith('WITHDRAW')) {
@@ -511,13 +531,18 @@ async function handleMessage(from, body) {
   }
 
   if (upper === 'HELP') {
-    return `Temi Commands\n\nMENU - Return to main menu\nBALANCE - Check your savings\nSAVE TRF123 - Record your daily contribution\nWITHDRAW 5000 - Withdraw an amount from your savings (available from day 10)\nFREEZE - Freeze your account\nHELP - Show this menu\n\nWithdrawing before your 30 day cycle ends attracts a small charge from our banking partner (N50 up to N10,000, N100 above that). MyAjo never adds anything on top. Complete the full cycle and there is no charge at all.\n\nFor support contact hello@myajo.ng`
+    const { data: user } = await supabase
+      .from('users')
+      .select('language')
+      .eq('whatsapp_number', whatsapp)
+      .single()
+
+    return getMessage('help', user?.language || 'en')
   }
 
   return `I did not understand that. Type MENU to see your options or HELP to see all commands.`
 }
 
-// --- WEBHOOK VERIFICATION (Meta calls this once when you connect the webhook) ---
 export async function GET(request) {
   const { searchParams } = new URL(request.url)
   const mode = searchParams.get('hub.mode')
@@ -530,7 +555,6 @@ export async function GET(request) {
   return new NextResponse('Verification failed', { status: 403 })
 }
 
-// --- INCOMING MESSAGES (Meta calls this every time a trader messages Temi) ---
 export async function POST(request) {
   try {
     const payload = await request.json()
@@ -539,9 +563,6 @@ export async function POST(request) {
     const change = entry?.changes?.[0]
     const message = change?.value?.messages?.[0]
 
-    // Meta also sends "status" updates (delivered/read) through this same endpoint.
-    // We only want to react to actual incoming text messages, so we quietly
-    // acknowledge anything else and stop.
     if (!message || message.type !== 'text') {
       return new NextResponse('OK', { status: 200 })
     }
