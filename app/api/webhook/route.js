@@ -2,48 +2,24 @@ import { NextResponse } from 'next/server'
 import { supabase } from '../../lib/supabase'
 import { sendMessage } from '../../lib/whatsapp'
 import { getMessage } from '../../lib/messages'
-import { quoteWithdrawalForCycle, processWithdrawal, stubPayout, getWithdrawableBalance } from '../../lib/withdrawal'
+import { quoteWithdrawalForCycle, processWithdrawal, stubPayout } from '../../lib/withdrawal'
+import { getSession, updateSession, clearSession } from '../../lib/session'
+import { getUserByWhatsapp, createOrUpdateAccount, freezeAccount } from '../../lib/accounts'
+import { getActiveCycle, startCycle, getBalanceSummary, getTodaysContribution, projectPlan } from '../../lib/savings'
 
 const META_VERIFY_TOKEN = process.env.META_VERIFY_TOKEN
 const APP_URL = process.env.APP_URL || 'https://my-ajo-ten.vercel.app'
 
-const COMMISSION_RATE = 0.03
-
-async function getSession(whatsapp) {
-  const { data } = await supabase
-    .from('sessions')
-    .select('*')
-    .eq('whatsapp_number', whatsapp)
-    .single()
-  return data
-}
-
-async function updateSession(whatsapp, step, tempData = {}) {
-  const existing = await getSession(whatsapp)
-  if (existing) {
-    await supabase
-      .from('sessions')
-      .update({ step, temp_data: tempData, updated_at: new Date().toISOString() })
-      .eq('whatsapp_number', whatsapp)
-  } else {
-    await supabase
-      .from('sessions')
-      .insert([{ whatsapp_number: whatsapp, step, temp_data: tempData }])
-  }
-}
-
-async function clearSession(whatsapp) {
-  await supabase
-    .from('sessions')
-    .update({ step: 'welcome', temp_data: {} })
-    .eq('whatsapp_number', whatsapp)
-}
+// NOTE: everything below is WhatsApp-specific — reading the trader's raw
+// text, matching commands, and writing back plain-text replies. All the
+// actual account/savings work now lives in lib/session.js, lib/accounts.js,
+// and lib/savings.js, and can be called the same way from any future
+// channel without touching this file.
 
 async function handleMessage(from, body) {
   const whatsapp = from.startsWith('234') ? '0' + from.slice(3) : from
   const message = body.trim()
   const upper = message.toUpperCase()
-
   const session = await getSession(whatsapp)
   const step = session ? session.step : 'welcome'
   const temp = session ? session.temp_data : {}
@@ -55,20 +31,10 @@ async function handleMessage(from, body) {
 
   if (step === 'main_menu') {
     if (message === '1') {
-      const { data: existingUser } = await supabase
-        .from('users')
-        .select('id')
-        .eq('whatsapp_number', whatsapp)
-        .single()
+      const existingUser = await getUserByWhatsapp(whatsapp)
 
       if (existingUser) {
-        const { data: activeCycle } = await supabase
-          .from('cycles')
-          .select('id')
-          .eq('user_id', existingUser.id)
-          .eq('status', 'active')
-          .single()
-
+        const activeCycle = await getActiveCycle(existingUser.id)
         if (activeCycle) {
           await clearSession(whatsapp)
           return `You already have an active savings cycle running.\n\nType BALANCE to check your savings, PAID to confirm today's transfer, or WITHDRAW followed by an amount to withdraw.`
@@ -81,36 +47,22 @@ async function handleMessage(from, body) {
 
     if (message === '2') {
       await updateSession(whatsapp, 'check_balance', {})
-      const { data: user } = await supabase
-        .from('users')
-        .select('id, full_name')
-        .eq('whatsapp_number', whatsapp)
-        .single()
+      const user = await getUserByWhatsapp(whatsapp)
 
       if (!user) {
         await clearSession(whatsapp)
         return `I could not find your account. Please type 1 to start your savings plan first.`
       }
 
-      const { data: cycle } = await supabase
-        .from('cycles')
-        .select('daily_amount, days_contributed, total_saved, commission')
-        .eq('user_id', user.id)
-        .eq('status', 'active')
-        .single()
-
+      const cycle = await getActiveCycle(user.id)
       if (!cycle) {
         await clearSession(whatsapp)
         return `You do not have an active savings cycle yet.\n\nType 1 to start your savings plan.`
       }
 
-      const daysRemaining = 30 - cycle.days_contributed
-      const expectedTotal = parseFloat(cycle.total_saved) + (daysRemaining * parseFloat(cycle.daily_amount))
-      const commission = parseFloat(cycle.commission)
-      const expectedPayout = expectedTotal - commission
-
+      const s = getBalanceSummary(cycle)
       await clearSession(whatsapp)
-      return `Your Savings\n\nHello ${user.full_name}\n\nSaved: N${parseFloat(cycle.total_saved).toLocaleString()}\nToday's status: ${cycle.days_contributed > 0 ? 'Active' : 'Not started'}\nDays completed: ${cycle.days_contributed} of 30\nDays remaining: ${daysRemaining}\n\nExpected total: N${expectedTotal.toLocaleString()}\nMyAjo commission: N${commission.toLocaleString()}\nYour payout: N${expectedPayout.toLocaleString()}\n\nType MENU to return to the main menu.`
+      return `Your Savings\n\nHello ${user.full_name}\n\nSaved: N${s.totalSaved.toLocaleString()}\nToday's status: ${s.daysContributed > 0 ? 'Active' : 'Not started'}\nDays completed: ${s.daysContributed} of 30\nDays remaining: ${s.daysRemaining}\n\nExpected total: N${s.expectedTotal.toLocaleString()}\nMyAjo commission: N${s.commission.toLocaleString()}\nYour payout: N${s.expectedPayout.toLocaleString()}\n\nType MENU to return to the main menu.`
     }
 
     if (message === '3') {
@@ -134,11 +86,7 @@ async function handleMessage(from, body) {
 
   if (step === 'awaiting_verification') {
     if (upper === 'DONE') {
-      const { data: user } = await supabase
-        .from('users')
-        .select('kyc_status')
-        .eq('whatsapp_number', whatsapp)
-        .single()
+      const user = await getUserByWhatsapp(whatsapp)
 
       if (user && user.kyc_status === 'verified') {
         await updateSession(whatsapp, 'get_email', temp)
@@ -152,7 +100,6 @@ async function handleMessage(from, body) {
 
       return `Still checking your details, this usually takes just a moment. Please type DONE again in a minute.`
     }
-
     return `Please complete your verification using the link above, then type DONE.`
   }
 
@@ -180,7 +127,7 @@ async function handleMessage(from, body) {
   if (step === 'confirm_account') {
     if (message === '1') {
       await updateSession(whatsapp, 'get_amount', temp)
-      return `How much would you like to save every day?\n\nExamples:\n1000\n2000\n3000\n5000\n\nReply with the amount in Naira.`
+      return `How much would you like to save every day?\n\nExamples:\n1000\n2000\n3000\n5000\n10000\n\nReply with the amount in Naira.`
     }
     if (message === '2') {
       await updateSession(whatsapp, 'get_bank', { full_name: temp.full_name })
@@ -198,75 +145,28 @@ async function handleMessage(from, body) {
       return `For daily amounts above N450,000, please contact our support team directly at hello@myajo.com.ng so we can set this up for you.`
     }
 
-    const totalSavings = amount * 30
-    const commission = Math.round(totalSavings * COMMISSION_RATE)
-    const payout = totalSavings - commission
-
+    const plan = projectPlan(amount)
     await updateSession(whatsapp, 'confirm_plan', { ...temp, daily_amount: amount })
-    return `Your Savings Plan\n\nDaily amount: N${amount.toLocaleString()}\nDuration: 30 days\nTotal savings: N${totalSavings.toLocaleString()}\nMyAjo commission: N${commission.toLocaleString()} (3%)\nYou will receive: N${payout.toLocaleString()}\n\nYour payout goes to:\n${temp.bank_name} - ${temp.bank_account_number}\n\nType CONFIRM to activate your savings plan or CANCEL to start over.`
+    return `Your Savings Plan\n\nDaily amount: N${amount.toLocaleString()}\nDuration: 30 days\nTotal savings: N${plan.totalSavings.toLocaleString()}\nMyAjo commission: N${plan.commission.toLocaleString()} (3%)\nYou will receive: N${plan.payout.toLocaleString()}\n\nYour payout goes to:\n${temp.bank_name} - ${temp.bank_account_number}\n\nType CONFIRM to activate your savings plan or CANCEL to start over.`
   }
 
   if (step === 'confirm_plan') {
     if (upper === 'CONFIRM') {
-      const { data: existingUser } = await supabase
-        .from('users')
-        .select('id')
-        .eq('whatsapp_number', whatsapp)
-        .single()
+      const userId = await createOrUpdateAccount(whatsapp, {
+        full_name: temp.full_name,
+        email: temp.email,
+        bank_name: temp.bank_name,
+        bank_account_number: temp.bank_account_number,
+      })
 
-      let userId
-
-      if (existingUser) {
-        userId = existingUser.id
-        await supabase
-          .from('users')
-          .update({
-            full_name: temp.full_name,
-            email: temp.email,
-            bank_name: temp.bank_name,
-            bank_account_number: temp.bank_account_number,
-          })
-          .eq('id', userId)
-      } else {
-        const { data: newUser } = await supabase
-          .from('users')
-          .insert([{
-            full_name: temp.full_name,
-            phone_number: whatsapp,
-            whatsapp_number: whatsapp,
-            email: temp.email,
-            bank_name: temp.bank_name,
-            bank_account_number: temp.bank_account_number,
-            bank_account_name: temp.full_name,
-            status: 'active',
-          }])
-          .select()
-          .single()
-        userId = newUser.id
-      }
-
-      const totalSavings = temp.daily_amount * 30
-      const commission = Math.round(totalSavings * COMMISSION_RATE)
-
-      await supabase
-        .from('cycles')
-        .insert([{
-          user_id: userId,
-          daily_amount: temp.daily_amount,
-          commission: commission,
-          status: 'active',
-          start_date: new Date().toISOString().split('T')[0],
-        }])
-
+      await startCycle(userId, temp.daily_amount)
       await clearSession(whatsapp)
       return `Your savings plan is now active!\n\n${temp.full_name} your MyAjo journey has begun.\n\nRemember to save N${parseFloat(temp.daily_amount).toLocaleString()} every day for 30 days.\n\nWhen your transfer goes through, we will confirm it automatically. You can also type PAID anytime to check.\n\nGood luck and stay consistent!`
     }
-
     if (upper === 'CANCEL') {
       await clearSession(whatsapp)
       return `No problem. Type MENU whenever you are ready to start your savings plan.`
     }
-
     return `Please type CONFIRM to activate your plan or CANCEL to start over.`
   }
 
@@ -276,35 +176,17 @@ async function handleMessage(from, body) {
   // Letting a typed word insert a contribution directly would let
   // anyone claim credit for a transfer they never made.
   if (upper === 'PAID') {
-    const { data: user } = await supabase
-      .from('users')
-      .select('id, full_name')
-      .eq('whatsapp_number', whatsapp)
-      .single()
-
+    const user = await getUserByWhatsapp(whatsapp)
     if (!user) {
       return `I could not find your account. Type MENU to get started.`
     }
 
-    const { data: cycle } = await supabase
-      .from('cycles')
-      .select('id, daily_amount, days_contributed, total_saved')
-      .eq('user_id', user.id)
-      .eq('status', 'active')
-      .single()
-
+    const cycle = await getActiveCycle(user.id)
     if (!cycle) {
       return `You do not have an active savings cycle. Type 1 to start one.`
     }
 
-    const today = new Date().toISOString().split('T')[0]
-    const { data: paidToday } = await supabase
-      .from('contributions')
-      .select('id')
-      .eq('cycle_id', cycle.id)
-      .eq('contribution_date', today)
-      .single()
-
+    const paidToday = await getTodaysContribution(cycle.id)
     if (paidToday) {
       const daysRemaining = 30 - cycle.days_contributed
       return getMessage('contribution_recorded', 'en', {
@@ -324,61 +206,34 @@ async function handleMessage(from, body) {
   }
 
   if (upper === 'BALANCE') {
-    const { data: user } = await supabase
-      .from('users')
-      .select('id, full_name')
-      .eq('whatsapp_number', whatsapp)
-      .single()
-
+    const user = await getUserByWhatsapp(whatsapp)
     if (!user) {
       return `I could not find your account. Type MENU to get started.`
     }
 
-    const { data: cycle } = await supabase
-      .from('cycles')
-      .select('daily_amount, days_contributed, total_saved, commission')
-      .eq('user_id', user.id)
-      .eq('status', 'active')
-      .single()
-
+    const cycle = await getActiveCycle(user.id)
     if (!cycle) {
       return `You do not have an active savings cycle.\n\nType 1 to start saving today.`
     }
 
-    const daysRemaining = 30 - cycle.days_contributed
-    const expectedTotal = parseFloat(cycle.total_saved) + (daysRemaining * parseFloat(cycle.daily_amount))
-    const commission = parseFloat(cycle.commission)
-    const expectedPayout = expectedTotal - commission
-    const filled = Math.round((cycle.days_contributed / 30) * 10)
-    const progressDisplay = '[' + '#'.repeat(filled) + '-'.repeat(10 - filled) + ']'
-    const withdrawLine = cycle.days_contributed >= 10
+    const s = getBalanceSummary(cycle)
+    const withdrawLine = s.canWithdraw
       ? `\n\nYou can withdraw anytime. Type WITHDRAW followed by an amount.`
-      : `\n\nWithdrawals unlock on day 10 (${10 - cycle.days_contributed} day${10 - cycle.days_contributed === 1 ? '' : 's'} to go).`
+      : `\n\nWithdrawals unlock on day 10 (${10 - s.daysContributed} day${10 - s.daysContributed === 1 ? '' : 's'} to go).`
 
-    return `Your Savings\n\nHello ${user.full_name}\n\nSaved: N${parseFloat(cycle.total_saved).toLocaleString()}\nDays completed: ${cycle.days_contributed} of 30\n\nProgress: ${progressDisplay} ${Math.round((cycle.days_contributed / 30) * 100)}%\n\nExpected total: N${expectedTotal.toLocaleString()}\nMyAjo commission: N${commission.toLocaleString()}\nYour payout: N${expectedPayout.toLocaleString()}${withdrawLine}\n\nKeep saving every day!`
+    return `Your Savings\n\nHello ${user.full_name}\n\nSaved: N${s.totalSaved.toLocaleString()}\nDays completed: ${s.daysContributed} of 30\n\nProgress: ${s.progressBar} ${s.progressPercent}%\n\nExpected total: N${s.expectedTotal.toLocaleString()}\nMyAjo commission: N${s.commission.toLocaleString()}\nYour payout: N${s.expectedPayout.toLocaleString()}${withdrawLine}\n\nKeep saving every day!`
   }
 
   if (upper.startsWith('WITHDRAW')) {
     const parts = message.split(' ')
     const amount = parseFloat((parts[1] || '').replace(/,/g, ''))
 
-    const { data: user } = await supabase
-      .from('users')
-      .select('id, full_name')
-      .eq('whatsapp_number', whatsapp)
-      .single()
-
+    const user = await getUserByWhatsapp(whatsapp)
     if (!user) {
       return `I could not find your account. Type MENU to get started.`
     }
 
-    const { data: cycle } = await supabase
-      .from('cycles')
-      .select('*')
-      .eq('user_id', user.id)
-      .eq('status', 'active')
-      .single()
-
+    const cycle = await getActiveCycle(user.id)
     if (!cycle) {
       return `You do not have an active savings cycle. Type 1 to start one.`
     }
@@ -388,7 +243,6 @@ async function handleMessage(from, body) {
     }
 
     const quote = await quoteWithdrawalForCycle(cycle, amount)
-
     if (!quote.allowed) {
       return quote.reason
     }
@@ -397,7 +251,6 @@ async function handleMessage(from, body) {
       cycleId: cycle.id,
       requestedAmount: quote.requestedAmount,
     })
-
     return quote.confirmationMessage
   }
 
@@ -412,7 +265,6 @@ async function handleMessage(from, body) {
     const cycleMsg = result.cycleEnded
       ? `\n\nYour savings cycle has ended. Type 1 to start a new one whenever you are ready.`
       : ''
-
     return `N${result.netAmount.toLocaleString()} is on its way to your account.${cycleMsg}`
   }
 
@@ -422,21 +274,12 @@ async function handleMessage(from, body) {
   }
 
   if (upper === 'FREEZE') {
-    const { data: user } = await supabase
-      .from('users')
-      .select('id, full_name')
-      .eq('whatsapp_number', whatsapp)
-      .single()
-
+    const user = await getUserByWhatsapp(whatsapp)
     if (!user) {
       return `I could not find your account. Please contact support immediately.`
     }
 
-    await supabase
-      .from('users')
-      .update({ status: 'frozen' })
-      .eq('id', user.id)
-
+    await freezeAccount(user.id)
     return `Your MyAjo account has been frozen immediately ${user.full_name}. No transactions can be made until you contact our support team to unfreeze it.\n\nContact us at hello@myajo.ng or call 08029708278.`
   }
 
@@ -456,13 +299,13 @@ export async function GET(request) {
   if (mode === 'subscribe' && token === META_VERIFY_TOKEN) {
     return new NextResponse(challenge, { status: 200 })
   }
+
   return new NextResponse('Verification failed', { status: 403 })
 }
 
 export async function POST(request) {
   try {
     const payload = await request.json()
-
     const entry = payload.entry?.[0]
     const change = entry?.changes?.[0]
     const message = change?.value?.messages?.[0]
