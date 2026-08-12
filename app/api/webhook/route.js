@@ -138,10 +138,10 @@ async function handleMessage(from, body) {
 
   if (step === 'get_amount') {
     const amount = parseFloat(message)
-    if (isNaN(amount) || amount < 1000) {
+    if (isNaN(amount) || amount < 100000) {
       return `The minimum daily savings amount is N1000. Please enter a valid amount.`
     }
-    if (amount > 450000) {
+    if (amount > 45000000) {
       return `For daily amounts above N450,000, please contact our support team directly at hello@myajo.com.ng so we can set this up for you.`
     }
 
