@@ -5,7 +5,7 @@ import { getMessage } from '../../lib/messages'
 import { quoteWithdrawalForCycle, processWithdrawal, stubPayout } from '../../lib/withdrawal'
 import { getSession, updateSession, clearSession } from '../../lib/session'
 import { getUserByWhatsapp, createOrUpdateAccount, freezeAccount } from '../../lib/accounts'
-import { getActiveCycle, startCycle, getBalanceSummary, getTodaysContribution, projectPlan } from '../../lib/savings'
+import { getActiveCycle, startCycle, getBalanceSummary, getTodaysContribution, projectPlan, validateDailyAmount, calculateCommission } from '../../lib/savings'
 
 const META_VERIFY_TOKEN = process.env.META_VERIFY_TOKEN
 const APP_URL = process.env.APP_URL || 'https://my-ajo-ten.vercel.app'
@@ -15,6 +15,12 @@ const APP_URL = process.env.APP_URL || 'https://my-ajo-ten.vercel.app'
 // actual account/savings work now lives in lib/session.js, lib/accounts.js,
 // and lib/savings.js, and can be called the same way from any future
 // channel without touching this file.
+//
+// UNITS: every amount in this file — trader input, session data, database
+// values, and WhatsApp text — is in NAIRA, matching lib/savings.js and the
+// COMMISSION_TIERS table. Kobo only matters at the point a request is
+// actually built for Anchor's API (not in this file) — that is the one
+// place a x100 conversion should happen.
 
 async function handleMessage(from, body) {
   const whatsapp = from.startsWith('234') ? '0' + from.slice(3) : from
@@ -67,7 +73,9 @@ async function handleMessage(from, body) {
 
     if (message === '3') {
       await clearSession(whatsapp)
-      return `How MyAjo Works\n\nMyAjo is a digital daily savings platform built on the trusted ajo tradition.\n\n1. You choose how much to save every day\n2. You save daily for 30 days\n3. At the end of 30 days you collect your full savings minus MyAjo commission of 3%\n\nExample:\nSave N1,000 every day\nTotal after 30 days: N30,000\nMyAjo commission: N900 (3%)\nYou receive: N29,100\n\nNeed your money before 30 days? You can withdraw anytime after day 10 — a small fee from our banking partner applies (N50 for withdrawals up to N10,000, N100 above that). MyAjo never charges you extra for this.\n\nYour money is safe and held by our licensed banking partner.\n\nType 1 to start saving today.`
+      const exampleCommission = calculateCommission(1000)
+      const examplePayout = 30000 - exampleCommission
+      return `How MyAjo Works\n\nMyAjo is a digital daily savings platform built on the trusted ajo tradition.\n\n1. You choose how much to save every day\n2. You save daily for 30 days\n3. At the end of 30 days you collect your full savings minus MyAjo's commission\n\nExample:\nSave N1,000 every day\nTotal after 30 days: N30,000\nMyAjo commission: N${exampleCommission.toLocaleString()}\nYou receive: N${examplePayout.toLocaleString()}\n\nNeed your money before 30 days? You can withdraw anytime after day 10 — a small fee from our banking partner applies (N50 for withdrawals up to N10,000, N100 above that). MyAjo never charges you extra for this.\n\nYour money is safe and held by our licensed banking partner.\n\nType 1 to start saving today.`
     }
 
     if (message === '4') {
@@ -138,16 +146,14 @@ async function handleMessage(from, body) {
 
   if (step === 'get_amount') {
     const amount = parseFloat(message)
-    if (isNaN(amount) || amount < 100000) {
-      return `The minimum daily savings amount is N1000. Please enter a valid amount.`
-    }
-    if (amount > 45000000) {
-      return `For daily amounts above N450,000, please contact our support team directly at hello@myajo.com.ng so we can set this up for you.`
+    const { valid, reason } = validateDailyAmount(amount)
+    if (!valid) {
+      return reason
     }
 
     const plan = projectPlan(amount)
     await updateSession(whatsapp, 'confirm_plan', { ...temp, daily_amount: amount })
-    return `Your Savings Plan\n\nDaily amount: N${amount.toLocaleString()}\nDuration: 30 days\nTotal savings: N${plan.totalSavings.toLocaleString()}\nMyAjo commission: N${plan.commission.toLocaleString()} (3%)\nYou will receive: N${plan.payout.toLocaleString()}\n\nYour payout goes to:\n${temp.bank_name} - ${temp.bank_account_number}\n\nType CONFIRM to activate your savings plan or CANCEL to start over.`
+    return `Your Savings Plan\n\nDaily amount: N${amount.toLocaleString()}\nDuration: 30 days\nTotal savings: N${plan.totalSavings.toLocaleString()}\nMyAjo commission: N${plan.commission.toLocaleString()}\nYou will receive: N${plan.payout.toLocaleString()}\n\nYour payout goes to:\n${temp.bank_name} - ${temp.bank_account_number}\n\nType CONFIRM to activate your savings plan or CANCEL to start over.`
   }
 
   if (step === 'confirm_plan') {
@@ -280,11 +286,11 @@ async function handleMessage(from, body) {
     }
 
     await freezeAccount(user.id)
-    return `Your MyAjo account has been frozen immediately ${user.full_name}. No transactions can be made until you contact our support team to unfreeze it.\n\nContact us at hello@myajo.ng or call 08029708278.`
+    return `Your MyAjo account has been frozen immediately ${user.full_name}. No transactions can be made until you contact our support team to unfreeze it.\n\nContact us at hello@myajo.com.ng or call 08029708278.`
   }
 
   if (upper === 'HELP') {
-    return `Temi Commands\n\nMENU - Return to main menu\nBALANCE - Check your savings\nPAID - Confirm today's transfer has gone through\nWITHDRAW 5000 - Withdraw an amount from your savings (available from day 10)\nFREEZE - Freeze your account\nHELP - Show this menu\n\nWithdrawing before your 30 day cycle ends attracts a small charge from our banking partner (N50 up to N10,000, N100 above that). MyAjo never adds anything on top. Complete the full cycle and there is no charge at all.\n\nFor support contact hello@myajo.ng`
+    return `Temi Commands\n\nMENU - Return to main menu\nBALANCE - Check your savings\nPAID - Confirm today's transfer has gone through\nWITHDRAW 5000 - Withdraw an amount from your savings (available from day 10)\nFREEZE - Freeze your account\nHELP - Show this menu\n\nWithdrawing before your 30 day cycle ends attracts a small charge from our banking partner (N50 up to N10,000, N100 above that). MyAjo never adds anything on top. Complete the full cycle and there is no charge at all.\n\nFor support contact hello@myajo.com.ng`
   }
 
   return `I did not understand that. Type MENU to see your options or HELP to see all commands.`
