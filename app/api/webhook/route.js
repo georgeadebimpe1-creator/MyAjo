@@ -22,6 +22,47 @@ const APP_URL = process.env.APP_URL || 'https://my-ajo-ten.vercel.app'
 // actually built for Anchor's API (not in this file) — that is the one
 // place a x100 conversion should happen.
 
+// Parses the trader's one-shot onboarding reply: full name, email, bank
+// name, account number, daily amount — each expected on its own line.
+// Blank lines are ignored so a trailing newline doesn't break the count.
+function parseOnboardingDetails(text) {
+  const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0)
+
+  if (lines.length !== 5) {
+    return {
+      valid: false,
+      reason: `I need all 5 details, each on its own line:\n\nFull Name\nEmail Address\nBank Name\nAccount Number\nDaily savings amount (1000-10000)\n\nExample:\nAda Okafor\nada@email.com\nGTBank\n0123456789\n5000`,
+    }
+  }
+
+  const [fullName, email, bankName, accountNumberRaw, amountRaw] = lines
+  const accountNumber = accountNumberRaw.replace(/\s/g, '')
+
+  if (!email.includes('@') || !email.includes('.')) {
+    return { valid: false, reason: `That email address doesn't look right. Please resend all 5 details with a valid email.` }
+  }
+  if (accountNumber.length < 10 || !/^\d+$/.test(accountNumber)) {
+    return { valid: false, reason: `That account number doesn't look right — it should be 10 digits. Please resend all 5 details.` }
+  }
+
+  const dailyAmount = parseFloat(amountRaw.replace(/,/g, ''))
+  const { valid, reason } = validateDailyAmount(dailyAmount)
+  if (!valid) {
+    return { valid: false, reason: `${reason}\n\nPlease resend all 5 details with a valid amount.` }
+  }
+
+  return {
+    valid: true,
+    data: {
+      full_name: fullName,
+      email,
+      bank_name: bankName,
+      bank_account_number: accountNumber,
+      daily_amount: dailyAmount,
+    },
+  }
+}
+
 async function handleMessage(from, body) {
   const whatsapp = from.startsWith('234') ? '0' + from.slice(3) : from
   const message = body.trim()
@@ -47,8 +88,9 @@ async function handleMessage(from, body) {
         }
       }
 
-      await updateSession(whatsapp, 'get_name', {})
-      return `Great! Let us create your savings plan.\n\nWhat is your full name?`
+      await updateSession(whatsapp, 'onboarding', {})
+      const verifyLink = `${APP_URL}/verify?ref=${whatsapp}`
+      return `Great! Let's set up your savings plan. Two things to do — in any order:\n\n1) Verify your identity here (takes about a minute):\n${verifyLink}\n\n2) Reply here with your details, one per line:\n\nFull Name\nEmail Address\nBank Name\nAccount Number\nDaily savings amount (1000-10000)\n\nExample:\nAda Okafor\nada@email.com\nGTBank\n0123456789\n5000\n\nOnce you've done both, type DONE.`
     }
 
     if (message === '2') {
@@ -86,74 +128,40 @@ async function handleMessage(from, body) {
     return `Please reply with a number between 1 and 4 to choose an option.\n\n1. Start Daily Savings\n2. Check My Balance\n3. Learn How It Works\n4. Speak with Support`
   }
 
-  if (step === 'get_name') {
-    const verifyLink = `${APP_URL}/verify?ref=${whatsapp}`
-    await updateSession(whatsapp, 'awaiting_verification', { ...temp, full_name: message })
-    return `Nice to meet you ${message}.\n\nTo keep your money safe, please verify your identity here:\n${verifyLink}\n\nIt takes about a minute. Once you're done, come back here and type DONE.`
-  }
-
-  if (step === 'awaiting_verification') {
+  // Onboarding is collapsed into 3 outbound Temi messages (was 8) to cut
+  // per-trader messaging cost. The trader can complete Dojah verification
+  // and type their details in parallel, since both are requested in the
+  // same message. Once details arrive, we validate and store them SILENTLY
+  // (no reply) so the details submission itself doesn't cost a message —
+  // the trader only hears back from Temi at DONE and at CONFIRM.
+  if (step === 'onboarding') {
     if (upper === 'DONE') {
       const user = await getUserByWhatsapp(whatsapp)
 
-      if (user && user.kyc_status === 'verified') {
-        await updateSession(whatsapp, 'get_email', temp)
-        return `You're verified! Just one more thing — what's your email address?`
+      if (!temp.full_name) {
+        return `I haven't received your details yet. Please send your full name, email, bank name, account number, and daily amount — each on its own line — then type DONE again.`
       }
 
-      if (user && user.kyc_status === 'failed') {
-        const verifyLink = `${APP_URL}/verify?ref=${whatsapp}`
-        return `Hmm, we couldn't verify your details. This usually happens if the photo was blurry or didn't match your BVN.\n\nPlease try again here: ${verifyLink}\n\nThen type DONE.`
+      if (!user || user.kyc_status !== 'verified') {
+        if (user && user.kyc_status === 'failed') {
+          const verifyLink = `${APP_URL}/verify?ref=${whatsapp}`
+          return `Hmm, we couldn't verify your details. This usually happens if the photo was blurry or didn't match your BVN.\n\nPlease try again here: ${verifyLink}\n\nThen type DONE.`
+        }
+        return `Still checking your verification, this usually takes just a moment. Please type DONE again in a minute.`
       }
 
-      return `Still checking your details, this usually takes just a moment. Please type DONE again in a minute.`
-    }
-    return `Please complete your verification using the link above, then type DONE.`
-  }
-
-  if (step === 'get_email') {
-    if (!message.includes('@') || !message.includes('.')) {
-      return `That doesn't look like a valid email address. Please try again.`
-    }
-    await updateSession(whatsapp, 'get_bank', { ...temp, email: message })
-    return `Got it. We will use your WhatsApp number as your savings account number so no extra registration is needed.\n\nWhich bank would you like your payout sent to?`
-  }
-
-  if (step === 'get_bank') {
-    await updateSession(whatsapp, 'get_account_number', { ...temp, bank_name: message })
-    return `Please enter your ${message} account number.`
-  }
-
-  if (step === 'get_account_number') {
-    if (message.length < 10) {
-      return `That account number looks too short. Please enter your full 10 digit account number.`
-    }
-    await updateSession(whatsapp, 'confirm_account', { ...temp, bank_account_number: message })
-    return `We found:\n\n${temp.full_name}\n${temp.bank_name}\n${message}\n\nIs this correct?\n\n1. Yes, that is correct\n2. No, let me re-enter`
-  }
-
-  if (step === 'confirm_account') {
-    if (message === '1') {
-      await updateSession(whatsapp, 'get_amount', temp)
-      return `How much would you like to save every day?\n\nExamples:\n1000\n2000\n3000\n5000\n10000\n\nReply with the amount in Naira.`
-    }
-    if (message === '2') {
-      await updateSession(whatsapp, 'get_bank', { full_name: temp.full_name })
-      return `No problem. Which bank would you like your payout sent to?`
-    }
-    return `Please reply with 1 to confirm or 2 to re-enter your details.`
-  }
-
-  if (step === 'get_amount') {
-    const amount = parseFloat(message)
-    const { valid, reason } = validateDailyAmount(amount)
-    if (!valid) {
-      return reason
+      const plan = projectPlan(temp.daily_amount)
+      await updateSession(whatsapp, 'confirm_plan', temp)
+      return `You're verified! Here's your plan:\n\nDaily amount: N${temp.daily_amount.toLocaleString()}\nDuration: 30 days\nTotal savings: N${plan.totalSavings.toLocaleString()}\nMyAjo commission: N${plan.commission.toLocaleString()}\nYou will receive: N${plan.payout.toLocaleString()}\n\nPayout goes to:\n${temp.bank_name} - ${temp.bank_account_number}\nName: ${temp.full_name}\nEmail: ${temp.email}\n\nIf this all looks correct, type CONFIRM to activate.\nIf anything needs fixing, type EDIT to re-enter your details.`
     }
 
-    const plan = projectPlan(amount)
-    await updateSession(whatsapp, 'confirm_plan', { ...temp, daily_amount: amount })
-    return `Your Savings Plan\n\nDaily amount: N${amount.toLocaleString()}\nDuration: 30 days\nTotal savings: N${plan.totalSavings.toLocaleString()}\nMyAjo commission: N${plan.commission.toLocaleString()}\nYou will receive: N${plan.payout.toLocaleString()}\n\nYour payout goes to:\n${temp.bank_name} - ${temp.bank_account_number}\n\nType CONFIRM to activate your savings plan or CANCEL to start over.`
+    // Any message that isn't DONE is treated as the details block.
+    const parsed = parseOnboardingDetails(message)
+    if (!parsed.valid) {
+      return parsed.reason
+    }
+    await updateSession(whatsapp, 'onboarding', { ...temp, ...parsed.data })
+    return null // silent — no message cost for a successful details submission
   }
 
   if (step === 'confirm_plan') {
@@ -169,11 +177,16 @@ async function handleMessage(from, body) {
       await clearSession(whatsapp)
       return `Your savings plan is now active!\n\n${temp.full_name} your MyAjo journey has begun.\n\nRemember to save N${parseFloat(temp.daily_amount).toLocaleString()} every day for 30 days.\n\nWhen your transfer goes through, we will confirm it automatically. You can also type PAID anytime to check.\n\nGood luck and stay consistent!`
     }
+    if (upper === 'EDIT') {
+      await updateSession(whatsapp, 'onboarding', {})
+      const verifyLink = `${APP_URL}/verify?ref=${whatsapp}`
+      return `No problem, let's redo your details.\n\nPlease reply with your details in this format (one per line):\n\nFull Name\nEmail Address\nBank Name\nAccount Number\nDaily savings amount (1000-10000)\n\nExample:\nAda Okafor\nada@email.com\nGTBank\n0123456789\n5000\n\nIf you still need to verify your identity, do that here too:\n${verifyLink}\n\nOnce done, type DONE.`
+    }
     if (upper === 'CANCEL') {
       await clearSession(whatsapp)
       return `No problem. Type MENU whenever you are ready to start your savings plan.`
     }
-    return `Please type CONFIRM to activate your plan or CANCEL to start over.`
+    return `Please type CONFIRM to activate your plan, EDIT to fix your details, or CANCEL to start over.`
   }
 
   // PAID — checks whether today's contribution has already been
@@ -324,7 +337,9 @@ export async function POST(request) {
     const body = message.text.body
 
     const responseText = await handleMessage(from, body)
-    await sendMessage(from, responseText)
+    if (responseText) {
+      await sendMessage(from, responseText)
+    }
 
     return new NextResponse('OK', { status: 200 })
   } catch (error) {
