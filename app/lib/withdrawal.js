@@ -1,10 +1,17 @@
 // app/lib/withdrawal.js
 //
-// Withdrawal I/O — reads/writes cycles and payouts, using YOUR existing
-// supabase client (same one route.js already imports). Kept separate from
+// Withdrawal I/O — reads/writes cycles and payouts. Kept separate from
 // withdrawalLogic.js so the fee math stays pure and testable.
+//
+// Uses supabaseAdmin (service role key), not the anon-key client — same
+// RLS reasoning as the other server-side files. Most writes here already
+// checked for errors; the two writes that run AFTER payoutFn succeeds
+// (updating the cycle, marking the payout completed) did not, which is
+// the riskiest place in the whole app for a silent failure: if either
+// of those silently fails, the money has already moved but the database
+// still shows the payout as 'pending' or the cycle as 'active'.
 
-import { supabase } from './supabase'
+import { supabaseAdmin } from './supabase'
 import { quoteWithdrawal } from './withdrawalLogic'
 
 /**
@@ -13,7 +20,7 @@ import { quoteWithdrawal } from './withdrawalLogic'
  * can never drift out of sync with total_saved as new contributions land.
  */
 export async function getWithdrawableBalance(cycle) {
-  const { data: priorPayouts, error } = await supabase
+  const { data: priorPayouts, error } = await supabaseAdmin
     .from('payouts')
     .select('gross_amount')
     .eq('cycle_id', cycle.id)
@@ -53,7 +60,7 @@ export async function quoteWithdrawalForCycle(cycle, requestedAmount) {
  * call once sandbox access is live, with no other changes needed here.
  */
 export async function processWithdrawal(cycleId, requestedAmount, payoutFn) {
-  const { data: cycle, error: cycleErr } = await supabase
+  const { data: cycle, error: cycleErr } = await supabaseAdmin
     .from('cycles')
     .select('*')
     .eq('id', cycleId)
@@ -74,7 +81,7 @@ export async function processWithdrawal(cycleId, requestedAmount, payoutFn) {
     return { success: false, reason: freshQuote.reason }
   }
 
-  const { data: payout, error: insertErr } = await supabase
+  const { data: payout, error: insertErr } = await supabaseAdmin
     .from('payouts')
     .insert([{
       cycle_id: cycle.id,
@@ -98,10 +105,14 @@ export async function processWithdrawal(cycleId, requestedAmount, payoutFn) {
   const payoutResult = await payoutFn({ userId: cycle.user_id, amount: freshQuote.netAmount })
 
   if (!payoutResult.success) {
-    await supabase
+    const { error: failUpdateErr } = await supabaseAdmin
       .from('payouts')
       .update({ status: 'failed', failed_reason: payoutResult.reason || 'Unknown error' })
       .eq('id', payout.id)
+
+    if (failUpdateErr) {
+      console.error('processWithdrawal: could not mark payout failed', payout.id, failUpdateErr)
+    }
     return { success: false, reason: 'The payout could not be completed. Please try again shortly, or contact support.' }
   }
 
@@ -119,9 +130,26 @@ export async function processWithdrawal(cycleId, requestedAmount, payoutFn) {
     cycleUpdate.end_date = new Date().toISOString().split('T')[0]
   }
 
-  await supabase.from('cycles').update(cycleUpdate).eq('id', cycle.id)
+  // CRITICAL: money has already moved (payoutFn succeeded) by this point.
+  // These two writes are no longer optional bookkeeping — if either
+  // fails, the database will disagree with reality (a completed payout
+  // still shown pending, or a cycle still shown active after it should
+  // have closed). Log loudly so this is never silent again; still return
+  // success to the trader since the money genuinely did move, but this
+  // now surfaces in logs for manual reconciliation instead of vanishing.
+  const { error: cycleUpdateErr } = await supabaseAdmin
+    .from('cycles')
+    .update(cycleUpdate)
+    .eq('id', cycle.id)
 
-  await supabase
+  if (cycleUpdateErr) {
+    console.error(
+      'processWithdrawal: PAYOUT SUCCEEDED but cycle update failed — needs manual reconciliation',
+      { cycleId: cycle.id, payoutId: payout.id, cycleUpdate, error: cycleUpdateErr }
+    )
+  }
+
+  const { error: payoutUpdateErr } = await supabaseAdmin
     .from('payouts')
     .update({
       status: 'completed',
@@ -129,6 +157,13 @@ export async function processWithdrawal(cycleId, requestedAmount, payoutFn) {
       bank_reference: payoutResult.bankReference || null,
     })
     .eq('id', payout.id)
+
+  if (payoutUpdateErr) {
+    console.error(
+      'processWithdrawal: PAYOUT SUCCEEDED but payout status update failed — needs manual reconciliation',
+      { payoutId: payout.id, error: payoutUpdateErr }
+    )
+  }
 
   return {
     success: true,
