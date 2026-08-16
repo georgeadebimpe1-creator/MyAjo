@@ -4,7 +4,7 @@ import { sendMessage } from '../../lib/whatsapp'
 import { getMessage } from '../../lib/messages'
 import { quoteWithdrawalForCycle, processWithdrawal, stubPayout } from '../../lib/withdrawal'
 import { getSession, updateSession, clearSession } from '../../lib/session'
-import { getUserByWhatsapp, createOrUpdateAccount, freezeAccount } from '../../lib/accounts'
+import { getUserByWhatsapp, createOrUpdateAccount, freezeAccount, provisionAnchorAccount } from '../../lib/accounts'
 import { getActiveCycle, startCycle, getBalanceSummary, getTodaysContribution, projectPlan, validateDailyAmount, calculateCommission } from '../../lib/savings'
 
 const META_VERIFY_TOKEN = process.env.META_VERIFY_TOKEN
@@ -173,9 +173,22 @@ async function handleMessage(from, body) {
         bank_account_number: temp.bank_account_number,
       })
 
+      // A trader needs a real account number to send money into before
+      // the cycle starts — otherwise Temi confirms a plan with nowhere
+      // for deposits to land. If Anchor provisioning fails, stop here
+      // and let the trader retry CONFIRM rather than starting a cycle
+      // that can never receive a deposit.
+      let anchorAccount
+      try {
+        anchorAccount = await provisionAnchorAccount(userId)
+      } catch (err) {
+        console.error('CONFIRM: Anchor provisioning failed', whatsapp, err)
+        return `We hit a snag setting up your deposit account (${err.message}). Please type CONFIRM again in a moment — if it keeps happening, type HELP to reach support.`
+      }
+
       await startCycle(userId, temp.daily_amount)
       await clearSession(whatsapp)
-      return `Your savings plan is now active!\n\n${temp.full_name} your MyAjo journey has begun.\n\nRemember to save N${parseFloat(temp.daily_amount).toLocaleString()} every day for 30 days.\n\nWhen your transfer goes through, we will confirm it automatically. You can also type PAID anytime to check.\n\nGood luck and stay consistent!`
+      return `Your savings plan is now active!\n\n${temp.full_name} your MyAjo journey has begun.\n\nSend your daily savings of N${parseFloat(temp.daily_amount).toLocaleString()} to this account:\n\nAccount Number: ${anchorAccount.accountNumber}\n(This is your dedicated MyAjo savings account, held with our licensed banking partner.)\n\nWhen your transfer goes through, we will confirm it automatically. You can also type PAID anytime to check.\n\nGood luck and stay consistent!`
     }
     if (upper === 'EDIT') {
       await updateSession(whatsapp, 'onboarding', {})
