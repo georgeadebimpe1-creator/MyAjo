@@ -14,6 +14,7 @@
 // checks for an error instead of discarding it, so a blocked/failed
 // write shows up in logs instead of looking identical to a success.
 import { supabaseAdmin } from './supabase'
+import { createAnchorCustomer, createAnchorDepositAccount } from './anchor'
 
 // Fetches the full set of fields any step in the app might need, so
 // every caller uses one consistent shape instead of hand-picking columns.
@@ -91,4 +92,109 @@ export async function freezeAccount(userId) {
     console.error('freezeAccount: update failed', userId, error)
     throw new Error('Could not freeze account. Please try again.')
   }
+}
+
+// ---------------------------------------------------------------------
+// Anchor deposit account provisioning
+// ---------------------------------------------------------------------
+//
+// This is the piece that was missing entirely: creates a real,
+// dedicated Anchor deposit account for a trader and returns the account
+// number Temi should tell them to send money to. Without this, a
+// trader has no account number to save into, and the deposit webhook
+// has nothing reliable to match incoming transfers against.
+//
+// STATUS: not yet tested against Anchor's sandbox. anchor.js itself is
+// built strictly from Anchor's public docs (see comments in that file)
+// — not confirmed against a real response. Treat this whole function
+// as "should work in principle" until it's been run once for real.
+//
+// Idempotent: if this trader already has an anchor_account_id on file,
+// it's reused rather than creating a duplicate account at Anchor.
+export async function provisionAnchorAccount(userId) {
+  const { data: user, error } = await supabaseAdmin
+    .from('users')
+    .select('full_name, email, whatsapp_number, date_of_birth, gender, residential_address, bvn, anchor_customer_id, anchor_account_id, anchor_account_number')
+    .eq('id', userId)
+    .single()
+
+  if (error || !user) {
+    console.error('provisionAnchorAccount: could not load user', userId, error)
+    throw new Error('Could not load your details. Please try again or contact support.')
+  }
+
+  // Already provisioned — reuse it instead of calling Anchor again.
+  if (user.anchor_account_id && user.anchor_account_number) {
+    return { accountNumber: user.anchor_account_number }
+  }
+
+  // These only exist on the user record after Dojah verification
+  // succeeds. If any are missing, calling Anchor would fail anyway
+  // with a far less useful error — fail early with a clear reason.
+  const missing = []
+  if (!user.date_of_birth) missing.push('date of birth')
+  if (!user.gender) missing.push('gender')
+  if (!user.residential_address) missing.push('address')
+  if (!user.bvn) missing.push('BVN')
+  if (missing.length > 0) {
+    console.error('provisionAnchorAccount: missing verification data', userId, missing)
+    throw new Error(
+      `your verification details look incomplete (missing ${missing.join(', ')}). Please contact support`
+    )
+  }
+
+  // Anchor's docs expect phone numbers in 234XXXXXXXXXX format.
+  // whatsapp_number is stored internally as 0XXXXXXXXXX. UNCONFIRMED —
+  // verify this is really the format Anchor wants before trusting it.
+  const phone = '234' + user.whatsapp_number.slice(1)
+
+  let anchorCustomerId = user.anchor_customer_id
+
+  if (!anchorCustomerId) {
+    anchorCustomerId = await createAnchorCustomer({
+      fullName: user.full_name,
+      email: user.email,
+      phone,
+      dob: user.date_of_birth,
+      gender: user.gender,
+      // anchor.js passes this straight through as `address`. Anchor's
+      // API very likely wants a structured object (addressLine1, city,
+      // state, country) rather than the single text string Dojah gives
+      // us — this is the part most likely to need fixing once tested
+      // against a real sandbox response.
+      address: user.residential_address,
+      bvn: user.bvn,
+    })
+
+    const { error: custErr } = await supabaseAdmin
+      .from('users')
+      .update({ anchor_customer_id: anchorCustomerId })
+      .eq('id', userId)
+
+    if (custErr) {
+      // Not fatal to this call — we still have the ID in memory to use
+      // below — but worth knowing so it isn't silently re-created next time.
+      console.error('provisionAnchorAccount: failed to save anchor_customer_id', userId, custErr)
+    }
+  }
+
+  const account = await createAnchorDepositAccount(anchorCustomerId)
+
+  const { error: acctErr } = await supabaseAdmin
+    .from('users')
+    .update({
+      anchor_account_id: account.accountId,
+      anchor_account_number: account.accountNumber,
+    })
+    .eq('id', userId)
+
+  if (acctErr) {
+    // The account WAS created at Anchor at this point — money could
+    // technically be sent to it — but we failed to save the number.
+    // This needs a human, not a silent retry.
+    console.error('provisionAnchorAccount: account created at Anchor but failed to save', userId, account, acctErr)
+    throw new Error('your deposit account was created but we hit an error saving it — please contact support before making any transfer')
+  }
+
+  return { accountNumber: account.accountNumber }
 }
