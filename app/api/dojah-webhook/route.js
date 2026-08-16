@@ -46,6 +46,17 @@ export async function POST(request) {
           ? `${entity.first_name} ${entity.last_name}`.trim()
           : entity.first_name || entity.last_name || null
 
+      // FIX 4 (NEW): the BVN itself was never being saved, even though
+      // the `users.bvn` column exists — nothing wrote to it. This is
+      // required before an Anchor customer/deposit account can be
+      // provisioned. UNCONFIRMED FIELD NAME: assuming `entity.bvn` —
+      // check a real logged payload (this route already logs the raw
+      // payload above) to confirm that's the right key before trusting
+      // it in production. If it's actually the key of `data` itself
+      // (e.g. Object.keys(bvnEntityContainer)[0]) rather than a field
+      // inside `entity`, this needs a one-line adjustment.
+      const bvn = entity.bvn || null
+
       // FIX 3: check the Supabase response for an error instead of
       // discarding it. Supabase does NOT throw on RLS-blocked writes —
       // it returns { error }, which the old code never inspected, so a
@@ -61,6 +72,7 @@ export async function POST(request) {
             date_of_birth: entity.date_of_birth || null,
             gender: entity.gender || null,
             residential_address: entity.residential_address || null,
+            bvn: bvn,
           },
           { onConflict: 'whatsapp_number' }
         )
@@ -68,6 +80,13 @@ export async function POST(request) {
       if (error) {
         console.error('Dojah webhook: Supabase upsert failed (verified)', whatsapp, error)
         return new NextResponse('Error', { status: 500 })
+      }
+
+      if (!bvn) {
+        // Don't fail the webhook over this — verification still succeeded
+        // and the trader shouldn't be stuck — but this needs eyes on it,
+        // since Anchor provisioning will fail without a BVN on file.
+        console.error('Dojah webhook: verified but no BVN captured — check payload shape', whatsapp)
       }
     } else {
       const { error } = await supabaseAdmin
