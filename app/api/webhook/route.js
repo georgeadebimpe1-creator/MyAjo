@@ -22,33 +22,61 @@ const APP_URL = process.env.APP_URL || 'https://my-ajo-ten.vercel.app'
 // actually built for Anchor's API (not in this file) — that is the one
 // place a x100 conversion should happen.
 
-// Parses the trader's one-shot onboarding reply: full name, email, bank
-// name, account number, daily amount — each expected on its own line.
-// Blank lines are ignored so a trailing newline doesn't break the count.
+// Parses the trader's one-shot onboarding reply: full name, email,
+// residential address, bank name, account number, daily amount — each
+// expected on its own line. Blank lines are ignored so a trailing
+// newline doesn't break the count.
+//
+// Address is asked for as "Street, City, State" on one line so it can
+// be split into the structured shape Anchor's customer-creation API
+// requires (addressLine_1/city/state/country) without adding a
+// separate onboarding step. Date of birth and gender are NOT collected
+// here — those come from Dojah's BVN lookup automatically once the
+// trader completes verification, and asking for them again would just
+// be typed data Anchor re-checks against the BVN record anyway.
 function parseOnboardingDetails(text) {
   const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0)
 
-  if (lines.length !== 5) {
+  if (lines.length !== 6) {
     return {
       valid: false,
-      reason: `I need all 5 details, each on its own line:\n\nFull Name\nEmail Address\nBank Name\nAccount Number\nDaily savings amount (1000-10000)\n\nExample:\nAda Okafor\nada@email.com\nGTBank\n0123456789\n5000`,
+      reason: `I need all 6 details, each on its own line:\n\nFull Name\nEmail Address\nResidential Address (Street, City, State)\nBank Name\nAccount Number\nDaily savings amount (1000-10000)\n\nExample:\nAda Okafor\nada@email.com\n12 Market Road, Ikeja, Lagos\nGTBank\n0123456789\n5000`,
     }
   }
 
-  const [fullName, email, bankName, accountNumberRaw, amountRaw] = lines
+  const [fullName, email, addressRaw, bankName, accountNumberRaw, amountRaw] = lines
   const accountNumber = accountNumberRaw.replace(/\s/g, '')
 
   if (!email.includes('@') || !email.includes('.')) {
-    return { valid: false, reason: `That email address doesn't look right. Please resend all 5 details with a valid email.` }
+    return { valid: false, reason: `That email address doesn't look right. Please resend all 6 details with a valid email.` }
   }
+
+  const addressParts = addressRaw.split(',').map(p => p.trim()).filter(p => p.length > 0)
+  if (addressParts.length < 2) {
+    return {
+      valid: false,
+      reason: `Please include your street address and state, separated by commas — for example: 12 Market Road, Ikeja, Lagos.\n\nPlease resend all 6 details.`,
+    }
+  }
+  const address = {
+    addressLine_1: addressParts[0],
+    city: addressParts.length >= 3 ? addressParts[1] : '',
+    state: addressParts[addressParts.length - 1],
+    postalCode: '',
+    country: 'NG',
+  }
+  // A plain readable line for record-keeping/display — the structured
+  // `address` object above is what actually goes to Anchor.
+  const addressDisplay = addressParts.join(', ')
+
   if (accountNumber.length < 10 || !/^\d+$/.test(accountNumber)) {
-    return { valid: false, reason: `That account number doesn't look right — it should be 10 digits. Please resend all 5 details.` }
+    return { valid: false, reason: `That account number doesn't look right — it should be 10 digits. Please resend all 6 details.` }
   }
 
   const dailyAmount = parseFloat(amountRaw.replace(/,/g, ''))
   const { valid, reason } = validateDailyAmount(dailyAmount)
   if (!valid) {
-    return { valid: false, reason: `${reason}\n\nPlease resend all 5 details with a valid amount.` }
+    return { valid: false, reason: `${reason}\n\nPlease resend all 6 details with a valid amount.` }
   }
 
   return {
@@ -56,30 +84,13 @@ function parseOnboardingDetails(text) {
     data: {
       full_name: fullName,
       email,
+      address,
+      address_display: addressDisplay,
       bank_name: bankName,
       bank_account_number: accountNumber,
       daily_amount: dailyAmount,
     },
   }
-}
-
-// Shared by "1" from the main menu AND "YES" after a cycle completes —
-// both are the same action (begin a fresh savings plan), so the logic
-// lives in one place instead of being duplicated and risking drift.
-async function beginNewSavingsPlan(whatsapp) {
-  const existingUser = await getUserByWhatsapp(whatsapp)
-
-  if (existingUser) {
-    const activeCycle = await getActiveCycle(existingUser.id)
-    if (activeCycle) {
-      await clearSession(whatsapp)
-      return `You already have an active savings cycle running.\n\nType BALANCE to check your savings, PAID to confirm today's transfer, or WITHDRAW followed by an amount to withdraw.`
-    }
-  }
-
-  await updateSession(whatsapp, 'onboarding', {})
-  const verifyLink = `${APP_URL}/verify?ref=${whatsapp}`
-  return `Great! Let's set up your savings plan. Two things to do — in any order:\n\n1) Verify your identity here (takes about a minute):\n${verifyLink}\n\n2) Reply here with your details, one per line:\n\nFull Name\nEmail Address\nBank Name\nAccount Number\nDaily savings amount (1000-10000)\n\nExample:\nAda Okafor\nada@email.com\nGTBank\n0123456789\n5000\n\nOnce you've done both, type DONE.`
 }
 
 async function handleMessage(from, body) {
@@ -97,7 +108,19 @@ async function handleMessage(from, body) {
 
   if (step === 'main_menu') {
     if (message === '1') {
-      return await beginNewSavingsPlan(whatsapp)
+      const existingUser = await getUserByWhatsapp(whatsapp)
+
+      if (existingUser) {
+        const activeCycle = await getActiveCycle(existingUser.id)
+        if (activeCycle) {
+          await clearSession(whatsapp)
+          return `You already have an active savings cycle running.\n\nType BALANCE to check your savings, PAID to confirm today's transfer, or WITHDRAW followed by an amount to withdraw.`
+        }
+      }
+
+      await updateSession(whatsapp, 'onboarding', {})
+      const verifyLink = `${APP_URL}/verify?ref=${whatsapp}`
+      return `Great! Let's set up your savings plan. Two things to do — in any order:\n\n1) Verify your identity here (takes about a minute):\n${verifyLink}\n\n2) Reply here with your details, one per line:\n\nFull Name\nEmail Address\nResidential Address (Street, City, State)\nBank Name\nAccount Number\nDaily savings amount (1000-10000)\n\nExample:\nAda Okafor\nada@email.com\n12 Market Road, Ikeja, Lagos\nGTBank\n0123456789\n5000\n\nOnce you've done both, type DONE.`
     }
 
     if (message === '2') {
@@ -159,7 +182,7 @@ async function handleMessage(from, body) {
 
       const plan = projectPlan(temp.daily_amount)
       await updateSession(whatsapp, 'confirm_plan', temp)
-      return `You're verified! Here's your plan:\n\nDaily amount: N${temp.daily_amount.toLocaleString()}\nDuration: 30 days\nTotal savings: N${plan.totalSavings.toLocaleString()}\nMyAjo commission: N${plan.commission.toLocaleString()}\nYou will receive: N${plan.payout.toLocaleString()}\n\nPayout goes to:\n${temp.bank_name} - ${temp.bank_account_number}\nName: ${temp.full_name}\nEmail: ${temp.email}\n\nIf this all looks correct, type CONFIRM to activate.\nIf anything needs fixing, type EDIT to re-enter your details.`
+      return `You're verified! Here's your plan:\n\nDaily amount: N${temp.daily_amount.toLocaleString()}\nDuration: 30 days\nTotal savings: N${plan.totalSavings.toLocaleString()}\nMyAjo commission: N${plan.commission.toLocaleString()}\nYou will receive: N${plan.payout.toLocaleString()}\n\nPayout goes to:\n${temp.bank_name} - ${temp.bank_account_number}\nName: ${temp.full_name}\nEmail: ${temp.email}\nAddress: ${temp.address_display}\n\nIf this all looks correct, type CONFIRM to activate.\nIf anything needs fixing, type EDIT to re-enter your details.`
     }
 
     // Any message that isn't DONE is treated as the details block.
@@ -178,6 +201,7 @@ async function handleMessage(from, body) {
         email: temp.email,
         bank_name: temp.bank_name,
         bank_account_number: temp.bank_account_number,
+        residential_address: temp.address_display,
       })
 
       // A trader needs a real account number to send money into before
@@ -187,7 +211,7 @@ async function handleMessage(from, body) {
       // that can never receive a deposit.
       let anchorAccount
       try {
-        anchorAccount = await provisionAnchorAccount(userId)
+        anchorAccount = await provisionAnchorAccount(userId, temp.address)
       } catch (err) {
         console.error('CONFIRM: Anchor provisioning failed', whatsapp, err)
         return `We hit a snag setting up your deposit account (${err.message}). Please type CONFIRM again in a moment — if it keeps happening, type HELP to reach support.`
@@ -200,25 +224,13 @@ async function handleMessage(from, body) {
     if (upper === 'EDIT') {
       await updateSession(whatsapp, 'onboarding', {})
       const verifyLink = `${APP_URL}/verify?ref=${whatsapp}`
-      return `No problem, let's redo your details.\n\nPlease reply with your details in this format (one per line):\n\nFull Name\nEmail Address\nBank Name\nAccount Number\nDaily savings amount (1000-10000)\n\nExample:\nAda Okafor\nada@email.com\nGTBank\n0123456789\n5000\n\nIf you still need to verify your identity, do that here too:\n${verifyLink}\n\nOnce done, type DONE.`
+      return `No problem, let's redo your details.\n\nPlease reply with your details in this format (one per line):\n\nFull Name\nEmail Address\nResidential Address (Street, City, State)\nBank Name\nAccount Number\nDaily savings amount (1000-10000)\n\nExample:\nAda Okafor\nada@email.com\n12 Market Road, Ikeja, Lagos\nGTBank\n0123456789\n5000\n\nIf you still need to verify your identity, do that here too:\n${verifyLink}\n\nOnce done, type DONE.`
     }
     if (upper === 'CANCEL') {
       await clearSession(whatsapp)
       return `No problem. Type MENU whenever you are ready to start your savings plan.`
     }
     return `Please type CONFIRM to activate your plan, EDIT to fix your details, or CANCEL to start over.`
-  }
-
-  // Trader typed YES right after a cycle finished — either automatically
-  // at day 30 (set by the Anchor deposit webhook) or after an early full
-  // withdrawal (set below). Reuses the exact same "start a new plan"
-  // logic as option 1 from the main menu, so there is only one place
-  // that logic lives.
-  if (step === 'cycle_complete') {
-    if (upper === 'YES') {
-      return await beginNewSavingsPlan(whatsapp)
-    }
-    return `Type YES to start a new 30-day savings cycle, or MENU to see all options.`
   }
 
   // PAID — checks whether today's contribution has already been
@@ -307,25 +319,16 @@ async function handleMessage(from, body) {
 
   if (upper === 'YES' && step === 'awaiting_withdrawal_confirmation') {
     const result = await processWithdrawal(temp.cycleId, temp.requestedAmount, stubPayout)
+    await clearSession(whatsapp)
 
     if (!result.success) {
-      await clearSession(whatsapp)
       return `Withdrawal could not be completed: ${result.reason}`
     }
 
-    if (result.cycleEnded) {
-      // Same handoff as the automatic day-30 completion: leave the
-      // trader in 'cycle_complete' so a follow-up YES starts a fresh
-      // plan, instead of clearing the session and losing that hook.
-      // Also makes the message consistent with the day-30 path, which
-      // asks for "YES" — this used to say "Type 1", a different command
-      // for the same outcome.
-      await updateSession(whatsapp, 'cycle_complete', {})
-      return `N${result.netAmount.toLocaleString()} is on its way to your account.\n\nYour savings cycle has ended.\n\nReady to begin your next cycle? Type YES.`
-    }
-
-    await clearSession(whatsapp)
-    return `N${result.netAmount.toLocaleString()} is on its way to your account.`
+    const cycleMsg = result.cycleEnded
+      ? `\n\nYour savings cycle has ended. Type 1 to start a new one whenever you are ready.`
+      : ''
+    return `N${result.netAmount.toLocaleString()} is on its way to your account.${cycleMsg}`
   }
 
   if (upper === 'NO' && step === 'awaiting_withdrawal_confirmation') {
