@@ -1,21 +1,47 @@
+
 // Anchor API helpers — account creation for each trader.
 //
-// IMPORTANT: this is built strictly from Anchor's public API documentation,
-// NOT confirmed directly with Anchor support (they haven't responded).
-// Two things specifically need real-sandbox testing once you have access:
-//   1. Whether an Anchor "customer" record needs to be created separately
-//      before the deposit account (this code assumes yes, based on the docs).
-//   2. Whether SAVINGS is genuinely usable, despite their support email
-//      saying otherwise — their own docs say yes, worth verifying in sandbox.
+// Built and corrected against Anchor's actual published documentation
+// (docs.getanchor.co/docs/create-individual-customer-1 and
+// docs.getanchor.co/docs/individual-customer-kyc), not guessed from
+// training data. Two real bugs were found and fixed here on 2026-08-16:
+//   1. dateOfBirth and gender were being sent as top-level attributes.
+//      Anchor's own example nests them inside `identificationLevel2`
+//      alongside bvn — that's Anchor's Tier 1 KYC upgrade, and it was
+//      very likely being silently ignored or rejected as written before.
+//   2. phoneNumber was being converted to 234XXXXXXXXXX format. Anchor's
+//      own example uses the plain local format ("07061234507") — the
+//      same 0XXXXXXXXXX format already used internally for
+//      whatsapp_number. No conversion needed; removed it.
+//
+// STILL UNCONFIRMED — worth real sandbox testing before fully trusting:
+//   - Whether a separate "customer" record truly must be created before
+//     a deposit account (this code assumes yes, per Anchor's flow).
+//   - Whether SAVINGS is genuinely usable as a deposit account product
+//     type (their docs say yes; their support email reportedly said
+//     otherwise — worth a direct sandbox test either way).
 
-export const ANCHOR_API_URL_UNUSED = null;
 const ANCHOR_API_URL = process.env.ANCHOR_API_URL || 'https://api.getanchor.co/api/v1'
 const ANCHOR_API_KEY = process.env.ANCHOR_API_KEY
 
-// Step 1: Create (or reuse) an Anchor customer record for this trader.
-// ASSUMPTION: Anchor requires a customer to exist before a deposit account
-// can be created for them — this mirrors the pattern in their docs for
-// individual verification, but hasn't been tested against a real response.
+// Anchor's documented shape for `address` is exactly these five fields.
+// `addressLine_2` isn't something MyAjo collects separately from the
+// trader — Anchor's own sample request reuses addressLine_1 for both,
+// so we do the same rather than sending an empty string.
+function normalizeAddress(address) {
+  return {
+    addressLine_1: address.addressLine_1,
+    addressLine_2: address.addressLine_2 || address.addressLine_1,
+    city: address.city || '',
+    state: address.state,
+    postalCode: address.postalCode || '',
+    country: address.country || 'NG',
+  }
+}
+
+// Step 1: Create (or reuse) an Anchor customer record for this trader,
+// at Tier 1 KYC (full name/address/email/phone at creation, plus
+// identificationLevel2 for the BVN-backed identity upgrade).
 async function createAnchorCustomer({ fullName, email, phone, dob, gender, address, bvn }) {
   const [firstName, ...rest] = fullName.trim().split(' ')
   const lastName = rest.join(' ') || firstName
@@ -31,12 +57,17 @@ async function createAnchorCustomer({ fullName, email, phone, dob, gender, addre
         type: 'IndividualCustomer',
         attributes: {
           fullName: { firstName, lastName },
+          address: normalizeAddress(address),
           email,
           phoneNumber: phone,
-          dateOfBirth: dob,
-          gender,
-          address,
-          identificationLevel2: { bvn },
+          // FIX: these three belong together under identificationLevel2 —
+          // this is what triggers Anchor's automatic Tier 1 KYC check
+          // (name + phone on the BVN record must match what's above).
+          identificationLevel2: {
+            dateOfBirth: dob,
+            gender,
+            bvn,
+          },
         },
       },
     }),
