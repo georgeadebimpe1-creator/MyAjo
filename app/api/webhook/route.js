@@ -63,6 +63,25 @@ function parseOnboardingDetails(text) {
   }
 }
 
+// Shared by "1" from the main menu AND "YES" after a cycle completes —
+// both are the same action (begin a fresh savings plan), so the logic
+// lives in one place instead of being duplicated and risking drift.
+async function beginNewSavingsPlan(whatsapp) {
+  const existingUser = await getUserByWhatsapp(whatsapp)
+
+  if (existingUser) {
+    const activeCycle = await getActiveCycle(existingUser.id)
+    if (activeCycle) {
+      await clearSession(whatsapp)
+      return `You already have an active savings cycle running.\n\nType BALANCE to check your savings, PAID to confirm today's transfer, or WITHDRAW followed by an amount to withdraw.`
+    }
+  }
+
+  await updateSession(whatsapp, 'onboarding', {})
+  const verifyLink = `${APP_URL}/verify?ref=${whatsapp}`
+  return `Great! Let's set up your savings plan. Two things to do — in any order:\n\n1) Verify your identity here (takes about a minute):\n${verifyLink}\n\n2) Reply here with your details, one per line:\n\nFull Name\nEmail Address\nBank Name\nAccount Number\nDaily savings amount (1000-10000)\n\nExample:\nAda Okafor\nada@email.com\nGTBank\n0123456789\n5000\n\nOnce you've done both, type DONE.`
+}
+
 async function handleMessage(from, body) {
   const whatsapp = from.startsWith('234') ? '0' + from.slice(3) : from
   const message = body.trim()
@@ -78,19 +97,7 @@ async function handleMessage(from, body) {
 
   if (step === 'main_menu') {
     if (message === '1') {
-      const existingUser = await getUserByWhatsapp(whatsapp)
-
-      if (existingUser) {
-        const activeCycle = await getActiveCycle(existingUser.id)
-        if (activeCycle) {
-          await clearSession(whatsapp)
-          return `You already have an active savings cycle running.\n\nType BALANCE to check your savings, PAID to confirm today's transfer, or WITHDRAW followed by an amount to withdraw.`
-        }
-      }
-
-      await updateSession(whatsapp, 'onboarding', {})
-      const verifyLink = `${APP_URL}/verify?ref=${whatsapp}`
-      return `Great! Let's set up your savings plan. Two things to do — in any order:\n\n1) Verify your identity here (takes about a minute):\n${verifyLink}\n\n2) Reply here with your details, one per line:\n\nFull Name\nEmail Address\nBank Name\nAccount Number\nDaily savings amount (1000-10000)\n\nExample:\nAda Okafor\nada@email.com\nGTBank\n0123456789\n5000\n\nOnce you've done both, type DONE.`
+      return await beginNewSavingsPlan(whatsapp)
     }
 
     if (message === '2') {
@@ -202,6 +209,18 @@ async function handleMessage(from, body) {
     return `Please type CONFIRM to activate your plan, EDIT to fix your details, or CANCEL to start over.`
   }
 
+  // Trader typed YES right after a cycle finished — either automatically
+  // at day 30 (set by the Anchor deposit webhook) or after an early full
+  // withdrawal (set below). Reuses the exact same "start a new plan"
+  // logic as option 1 from the main menu, so there is only one place
+  // that logic lives.
+  if (step === 'cycle_complete') {
+    if (upper === 'YES') {
+      return await beginNewSavingsPlan(whatsapp)
+    }
+    return `Type YES to start a new 30-day savings cycle, or MENU to see all options.`
+  }
+
   // PAID — checks whether today's contribution has already been
   // confirmed by the Anchor deposit webhook. This does NOT record a
   // contribution itself; only a real, bank-confirmed deposit does that.
@@ -288,16 +307,25 @@ async function handleMessage(from, body) {
 
   if (upper === 'YES' && step === 'awaiting_withdrawal_confirmation') {
     const result = await processWithdrawal(temp.cycleId, temp.requestedAmount, stubPayout)
-    await clearSession(whatsapp)
 
     if (!result.success) {
+      await clearSession(whatsapp)
       return `Withdrawal could not be completed: ${result.reason}`
     }
 
-    const cycleMsg = result.cycleEnded
-      ? `\n\nYour savings cycle has ended. Type 1 to start a new one whenever you are ready.`
-      : ''
-    return `N${result.netAmount.toLocaleString()} is on its way to your account.${cycleMsg}`
+    if (result.cycleEnded) {
+      // Same handoff as the automatic day-30 completion: leave the
+      // trader in 'cycle_complete' so a follow-up YES starts a fresh
+      // plan, instead of clearing the session and losing that hook.
+      // Also makes the message consistent with the day-30 path, which
+      // asks for "YES" — this used to say "Type 1", a different command
+      // for the same outcome.
+      await updateSession(whatsapp, 'cycle_complete', {})
+      return `N${result.netAmount.toLocaleString()} is on its way to your account.\n\nYour savings cycle has ended.\n\nReady to begin your next cycle? Type YES.`
+    }
+
+    await clearSession(whatsapp)
+    return `N${result.netAmount.toLocaleString()} is on its way to your account.`
   }
 
   if (upper === 'NO' && step === 'awaiting_withdrawal_confirmation') {
