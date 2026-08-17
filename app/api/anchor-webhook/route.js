@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { supabase } from '../../lib/supabase'
+import { supabaseAdmin } from '../../lib/supabase'
 import { sendMessage } from '../../lib/whatsapp'
 import { getMessage } from '../../lib/messages'
 import { getWithdrawableBalance, processWithdrawal } from '../../lib/withdrawal'
@@ -9,6 +9,11 @@ import { updateSession } from '../../lib/session'
 export async function POST(request) {
   try {
     const payload = await request.json()
+
+    if (!supabaseAdmin) {
+      console.error('Anchor webhook: SUPABASE_SERVICE_ROLE_KEY is not set, cannot write to database')
+      return new NextResponse('Server misconfigured', { status: 500 })
+    }
 
     // CONFIRMED with Anchor (2026 Slack thread): three events fire per
     // inbound transfer — nip.inbound.received, nip.inbound.settled, and
@@ -39,26 +44,26 @@ export async function POST(request) {
       return new NextResponse('OK', { status: 200 })
     }
 
-    const { data: user } = await supabase
+    const { data: user, error: userErr } = await supabaseAdmin
       .from('users')
       .select('id, full_name, whatsapp_number')
       .eq('anchor_account_id', anchorAccountId)
       .single()
 
-    if (!user) {
-      console.error('Anchor webhook: no user found for account', anchorAccountId)
+    if (userErr || !user) {
+      console.error('Anchor webhook: no user found for account', anchorAccountId, userErr)
       return new NextResponse('OK', { status: 200 })
     }
 
-    const { data: cycle } = await supabase
+    const { data: cycle, error: cycleErr } = await supabaseAdmin
       .from('cycles')
       .select('id, daily_amount, days_contributed, total_saved, commission, bank_name')
       .eq('user_id', user.id)
       .eq('status', 'active')
       .single()
 
-    if (!cycle) {
-      console.error('Anchor webhook: no active cycle for user', user.id)
+    if (cycleErr || !cycle) {
+      console.error('Anchor webhook: no active cycle for user', user.id, cycleErr)
       return new NextResponse('OK', { status: 200 })
     }
 
@@ -67,7 +72,7 @@ export async function POST(request) {
     // Same-day duplicate guard — without this, a retried or repeated
     // Anchor webhook event could record the same deposit twice and
     // inflate the trader's savings total.
-    const { data: alreadyPaid } = await supabase
+    const { data: alreadyPaid } = await supabaseAdmin
       .from('contributions')
       .select('id')
       .eq('cycle_id', cycle.id)
@@ -79,7 +84,7 @@ export async function POST(request) {
       return new NextResponse('OK', { status: 200 })
     }
 
-    await supabase.from('contributions').insert([{
+    const { error: insertErr } = await supabaseAdmin.from('contributions').insert([{
       cycle_id: cycle.id,
       user_id: user.id,
       amount: amountNaira,
@@ -88,15 +93,27 @@ export async function POST(request) {
       contribution_type: 'daily',
     }])
 
+    if (insertErr) {
+      // A real deposit landed at Anchor but we failed to record it —
+      // this needs a human, not a silent drop. The trader will not get
+      // a confirmation message as a result of this early return.
+      console.error('Anchor webhook: MONEY RECEIVED but contribution insert failed — needs manual reconciliation', { userId: user.id, cycleId: cycle.id, amountNaira, error: insertErr })
+      return new NextResponse('OK', { status: 200 })
+    }
+
     const newDays = cycle.days_contributed + 1
     const newTotal = parseFloat(cycle.total_saved) + amountNaira
     const commission = parseFloat(cycle.commission)
     const daysRemaining = 30 - newDays
 
-    await supabase
+    const { error: cycleUpdateErr } = await supabaseAdmin
       .from('cycles')
       .update({ days_contributed: newDays, total_saved: newTotal })
       .eq('id', cycle.id)
+
+    if (cycleUpdateErr) {
+      console.error('Anchor webhook: contribution recorded but cycle update failed — needs manual reconciliation', { cycleId: cycle.id, newDays, newTotal, error: cycleUpdateErr })
+    }
 
     // Day 30 — cycle complete, trigger payout automatically.
     if (newDays === 30) {
