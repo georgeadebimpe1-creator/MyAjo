@@ -49,6 +49,7 @@ export async function createOrUpdateAccount(whatsapp, details) {
         email: details.email,
         bank_name: details.bank_name,
         bank_account_number: details.bank_account_number,
+        residential_address: details.residential_address,
       })
       .eq('id', existingUser.id)
 
@@ -70,6 +71,7 @@ export async function createOrUpdateAccount(whatsapp, details) {
       bank_name: details.bank_name,
       bank_account_number: details.bank_account_number,
       bank_account_name: details.full_name,
+      residential_address: details.residential_address,
       status: 'active',
     }])
     .select()
@@ -192,10 +194,18 @@ export async function verifyAndLinkResolvedBank(userId, bank, accountNumber) {
 //
 // Idempotent: if this trader already has an anchor_account_id on file,
 // it's reused rather than creating a duplicate account at Anchor.
-export async function provisionAnchorAccount(userId) {
+//
+// `address` is the STRUCTURED object built in route.js's
+// parseOnboardingDetails ({ addressLine_1, city, state, postalCode,
+// country }) — Anchor's customer-creation API needs this shape, not the
+// single display string stored in the users table for readability.
+// Passed in directly from the onboarding flow rather than re-read from
+// residential_address (which only holds the display string) since that
+// was the exact gap flagged as "most likely to need fixing" before.
+export async function provisionAnchorAccount(userId, address) {
   const { data: user, error } = await supabaseAdmin
     .from('users')
-    .select('full_name, email, whatsapp_number, date_of_birth, gender, residential_address, bvn, anchor_customer_id, anchor_account_id, anchor_account_number')
+    .select('full_name, email, whatsapp_number, date_of_birth, gender, bvn, anchor_customer_id, anchor_account_id, anchor_account_number')
     .eq('id', userId)
     .single()
 
@@ -209,14 +219,16 @@ export async function provisionAnchorAccount(userId) {
     return { accountNumber: user.anchor_account_number }
   }
 
-  // These only exist on the user record after Dojah verification
-  // succeeds. If any are missing, calling Anchor would fail anyway
-  // with a far less useful error — fail early with a clear reason.
+  // date_of_birth/gender/bvn only exist on the user record after Dojah
+  // verification succeeds. address is passed in directly from the
+  // onboarding session, not read from the DB. If any are missing,
+  // calling Anchor would fail anyway with a far less useful error —
+  // fail early with a clear reason.
   const missing = []
   if (!user.date_of_birth) missing.push('date of birth')
   if (!user.gender) missing.push('gender')
-  if (!user.residential_address) missing.push('address')
   if (!user.bvn) missing.push('BVN')
+  if (!address || !address.addressLine_1 || !address.state) missing.push('address')
   if (missing.length > 0) {
     console.error('provisionAnchorAccount: missing verification data', userId, missing)
     throw new Error(
@@ -238,12 +250,11 @@ export async function provisionAnchorAccount(userId) {
       phone,
       dob: user.date_of_birth,
       gender: user.gender,
-      // anchor.js passes this straight through as `address`. Anchor's
-      // API very likely wants a structured object (addressLine1, city,
-      // state, country) rather than the single text string Dojah gives
-      // us — this is the part most likely to need fixing once tested
-      // against a real sandbox response.
-      address: user.residential_address,
+      // Structured address, passed in directly from onboarding — this
+      // is the shape Anchor's customer-creation API needs
+      // (addressLine_1/city/state/postalCode/country), not a single
+      // display string.
+      address,
       bvn: user.bvn,
     })
 
