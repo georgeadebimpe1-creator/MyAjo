@@ -2,9 +2,10 @@ import { NextResponse } from 'next/server'
 import { supabase } from '../../lib/supabase'
 import { sendMessage } from '../../lib/whatsapp'
 import { getMessage } from '../../lib/messages'
-import { quoteWithdrawalForCycle, processWithdrawal, stubPayout } from '../../lib/withdrawal'
+import { quoteWithdrawalForCycle, processWithdrawal } from '../../lib/withdrawal'
+import { anchorPayout } from '../../lib/payout'
 import { getSession, updateSession, clearSession } from '../../lib/session'
-import { getUserByWhatsapp, createOrUpdateAccount, freezeAccount, provisionAnchorAccount } from '../../lib/accounts'
+import { getUserByWhatsapp, createOrUpdateAccount, freezeAccount, provisionAnchorAccount, verifyAndLinkBankAccount, verifyAndLinkResolvedBank } from '../../lib/accounts'
 import { getActiveCycle, startCycle, getBalanceSummary, getTodaysContribution, projectPlan, validateDailyAmount, calculateCommission } from '../../lib/savings'
 
 const META_VERIFY_TOKEN = process.env.META_VERIFY_TOKEN
@@ -65,8 +66,6 @@ function parseOnboardingDetails(text) {
     postalCode: '',
     country: 'NG',
   }
-  // A plain readable line for record-keeping/display — the structured
-  // `address` object above is what actually goes to Anchor.
   const addressDisplay = addressParts.join(', ')
 
   if (accountNumber.length < 10 || !/^\d+$/.test(accountNumber)) {
@@ -93,6 +92,27 @@ function parseOnboardingDetails(text) {
   }
 }
 
+async function beginNewSavingsPlan(whatsapp) {
+  const existingUser = await getUserByWhatsapp(whatsapp)
+
+  if (existingUser) {
+    const activeCycle = await getActiveCycle(existingUser.id)
+    if (activeCycle) {
+      await clearSession(whatsapp)
+      return `You already have an active savings cycle running.\n\nType BALANCE to check your savings, PAID to confirm today's transfer, or WITHDRAW followed by an amount to withdraw.`
+    }
+  }
+
+  await updateSession(whatsapp, 'onboarding', {})
+  const verifyLink = `${APP_URL}/verify?ref=${whatsapp}`
+  return `Great! Let's set up your savings plan. Two things to do — in any order:\n\n1) Verify your identity here (takes about a minute):\n${verifyLink}\n\n2) Reply here with your details, one per line:\n\nFull Name\nEmail Address\nResidential Address (Street, City, State)\nBank Name\nAccount Number\nDaily savings amount (1000-10000)\n\nExample:\nAda Okafor\nada@email.com\n12 Market Road, Ikeja, Lagos\nGTBank\n0123456789\n5000\n\nOnce you've done both, type DONE.`
+}
+
+function buildPlanMessage(temp) {
+  const plan = projectPlan(temp.daily_amount)
+  return `You're verified! Here's your plan:\n\nDaily amount: N${temp.daily_amount.toLocaleString()}\nDuration: 30 days\nTotal savings: N${plan.totalSavings.toLocaleString()}\nMyAjo commission: N${plan.commission.toLocaleString()}\nYou will receive: N${plan.payout.toLocaleString()}\n\nPayout goes to:\n${temp.bank_name} - ${temp.bank_account_number}\nName: ${temp.full_name}\nEmail: ${temp.email}\nAddress: ${temp.address_display}\n\nIf this all looks correct, type CONFIRM to activate.\nIf anything needs fixing, type EDIT to re-enter your details.`
+}
+
 async function handleMessage(from, body) {
   const whatsapp = from.startsWith('234') ? '0' + from.slice(3) : from
   const message = body.trim()
@@ -108,19 +128,7 @@ async function handleMessage(from, body) {
 
   if (step === 'main_menu') {
     if (message === '1') {
-      const existingUser = await getUserByWhatsapp(whatsapp)
-
-      if (existingUser) {
-        const activeCycle = await getActiveCycle(existingUser.id)
-        if (activeCycle) {
-          await clearSession(whatsapp)
-          return `You already have an active savings cycle running.\n\nType BALANCE to check your savings, PAID to confirm today's transfer, or WITHDRAW followed by an amount to withdraw.`
-        }
-      }
-
-      await updateSession(whatsapp, 'onboarding', {})
-      const verifyLink = `${APP_URL}/verify?ref=${whatsapp}`
-      return `Great! Let's set up your savings plan. Two things to do — in any order:\n\n1) Verify your identity here (takes about a minute):\n${verifyLink}\n\n2) Reply here with your details, one per line:\n\nFull Name\nEmail Address\nResidential Address (Street, City, State)\nBank Name\nAccount Number\nDaily savings amount (1000-10000)\n\nExample:\nAda Okafor\nada@email.com\n12 Market Road, Ikeja, Lagos\nGTBank\n0123456789\n5000\n\nOnce you've done both, type DONE.`
+      return await beginNewSavingsPlan(whatsapp)
     }
 
     if (message === '2') {
@@ -158,18 +166,12 @@ async function handleMessage(from, body) {
     return `Please reply with a number between 1 and 4 to choose an option.\n\n1. Start Daily Savings\n2. Check My Balance\n3. Learn How It Works\n4. Speak with Support`
   }
 
-  // Onboarding is collapsed into 3 outbound Temi messages (was 8) to cut
-  // per-trader messaging cost. The trader can complete Dojah verification
-  // and type their details in parallel, since both are requested in the
-  // same message. Once details arrive, we validate and store them SILENTLY
-  // (no reply) so the details submission itself doesn't cost a message —
-  // the trader only hears back from Temi at DONE and at CONFIRM.
   if (step === 'onboarding') {
     if (upper === 'DONE') {
       const user = await getUserByWhatsapp(whatsapp)
 
       if (!temp.full_name) {
-        return `I haven't received your details yet. Please send your full name, email, bank name, account number, and daily amount — each on its own line — then type DONE again.`
+        return `I haven't received your details yet. Please send your full name, email, residential address, bank name, account number, and daily amount — each on its own line — then type DONE again.`
       }
 
       if (!user || user.kyc_status !== 'verified') {
@@ -180,18 +182,66 @@ async function handleMessage(from, body) {
         return `Still checking your verification, this usually takes just a moment. Please type DONE again in a minute.`
       }
 
-      const plan = projectPlan(temp.daily_amount)
+      if (!temp.bank_verified) {
+        let bankResult
+        try {
+          bankResult = await verifyAndLinkBankAccount(user.id, temp.bank_name, temp.bank_account_number)
+        } catch (err) {
+          console.error('DONE: bank verification threw unexpectedly', whatsapp, err)
+          return `We hit a snag verifying your bank details (${err.message}). Please type DONE again in a moment, or type EDIT to re-enter your details.`
+        }
+
+        if (bankResult.retype) {
+          return `We couldn't find a bank matching "${temp.bank_name}". Please resend all 6 details with the correct bank name.`
+        }
+
+        if (bankResult.needsSelection) {
+          const numbered = bankResult.candidates.map((c, i) => `${i + 1}. ${c.name}`).join('\n')
+          await updateSession(whatsapp, 'select_bank', {
+            ...temp,
+            userId: user.id,
+            bankCandidates: bankResult.candidates,
+          })
+          return `A few banks matched "${temp.bank_name}" — which one is it?\n\n${numbered}\n\nReply with the number.`
+        }
+
+        temp.bank_name = bankResult.bankName
+        temp.bank_verified = true
+      }
+
       await updateSession(whatsapp, 'confirm_plan', temp)
-      return `You're verified! Here's your plan:\n\nDaily amount: N${temp.daily_amount.toLocaleString()}\nDuration: 30 days\nTotal savings: N${plan.totalSavings.toLocaleString()}\nMyAjo commission: N${plan.commission.toLocaleString()}\nYou will receive: N${plan.payout.toLocaleString()}\n\nPayout goes to:\n${temp.bank_name} - ${temp.bank_account_number}\nName: ${temp.full_name}\nEmail: ${temp.email}\nAddress: ${temp.address_display}\n\nIf this all looks correct, type CONFIRM to activate.\nIf anything needs fixing, type EDIT to re-enter your details.`
+      return buildPlanMessage(temp)
     }
 
-    // Any message that isn't DONE is treated as the details block.
     const parsed = parseOnboardingDetails(message)
     if (!parsed.valid) {
       return parsed.reason
     }
     await updateSession(whatsapp, 'onboarding', { ...temp, ...parsed.data })
-    return null // silent — no message cost for a successful details submission
+    return null
+  }
+
+  if (step === 'select_bank') {
+    const choice = parseInt(message, 10)
+    const candidates = temp.bankCandidates || []
+
+    if (isNaN(choice) || choice < 1 || choice > candidates.length) {
+      const numbered = candidates.map((c, i) => `${i + 1}. ${c.name}`).join('\n')
+      return `Please reply with just the number of your bank:\n\n${numbered}`
+    }
+
+    const chosen = candidates[choice - 1]
+    let bankResult
+    try {
+      bankResult = await verifyAndLinkResolvedBank(temp.userId, chosen, temp.bank_account_number)
+    } catch (err) {
+      console.error('select_bank: verification failed', temp.userId, chosen, err)
+      return `We hit a snag verifying that account (${err.message}). Please reply with the number again, or type MENU to start over.`
+    }
+
+    const updatedTemp = { ...temp, bank_name: bankResult.bankName, bank_verified: true }
+    await updateSession(whatsapp, 'confirm_plan', updatedTemp)
+    return buildPlanMessage(updatedTemp)
   }
 
   if (step === 'confirm_plan') {
@@ -204,11 +254,6 @@ async function handleMessage(from, body) {
         residential_address: temp.address_display,
       })
 
-      // A trader needs a real account number to send money into before
-      // the cycle starts — otherwise Temi confirms a plan with nowhere
-      // for deposits to land. If Anchor provisioning fails, stop here
-      // and let the trader retry CONFIRM rather than starting a cycle
-      // that can never receive a deposit.
       let anchorAccount
       try {
         anchorAccount = await provisionAnchorAccount(userId, temp.address)
@@ -233,11 +278,13 @@ async function handleMessage(from, body) {
     return `Please type CONFIRM to activate your plan, EDIT to fix your details, or CANCEL to start over.`
   }
 
-  // PAID — checks whether today's contribution has already been
-  // confirmed by the Anchor deposit webhook. This does NOT record a
-  // contribution itself; only a real, bank-confirmed deposit does that.
-  // Letting a typed word insert a contribution directly would let
-  // anyone claim credit for a transfer they never made.
+  if (step === 'cycle_complete') {
+    if (upper === 'YES') {
+      return await beginNewSavingsPlan(whatsapp)
+    }
+    return `Type YES to start a new 30-day savings cycle, or MENU to see all options.`
+  }
+
   if (upper === 'PAID') {
     const user = await getUserByWhatsapp(whatsapp)
     if (!user) {
@@ -263,7 +310,6 @@ async function handleMessage(from, body) {
     return `We haven't received your transfer yet. Bank transfers can take a few minutes to reflect — Temi will confirm automatically as soon as it comes in. If it's been more than 30 minutes, type HELP to contact support.`
   }
 
-  // Redirect anyone still typing the old SAVE command.
   if (upper.startsWith('SAVE')) {
     return `We've simplified this — you no longer need to send a reference number. Just make your transfer, then reply PAID and Temi will confirm it for you.`
   }
@@ -318,17 +364,20 @@ async function handleMessage(from, body) {
   }
 
   if (upper === 'YES' && step === 'awaiting_withdrawal_confirmation') {
-    const result = await processWithdrawal(temp.cycleId, temp.requestedAmount, stubPayout)
-    await clearSession(whatsapp)
+    const result = await processWithdrawal(temp.cycleId, temp.requestedAmount, anchorPayout)
 
     if (!result.success) {
+      await clearSession(whatsapp)
       return `Withdrawal could not be completed: ${result.reason}`
     }
 
-    const cycleMsg = result.cycleEnded
-      ? `\n\nYour savings cycle has ended. Type 1 to start a new one whenever you are ready.`
-      : ''
-    return `N${result.netAmount.toLocaleString()} is on its way to your account.${cycleMsg}`
+    if (result.cycleEnded) {
+      await updateSession(whatsapp, 'cycle_complete', {})
+      return `N${result.netAmount.toLocaleString()} is on its way to your account.\n\nYour savings cycle has ended.\n\nReady to begin your next cycle? Type YES.`
+    }
+
+    await clearSession(whatsapp)
+    return `N${result.netAmount.toLocaleString()} is on its way to your account.`
   }
 
   if (upper === 'NO' && step === 'awaiting_withdrawal_confirmation') {
