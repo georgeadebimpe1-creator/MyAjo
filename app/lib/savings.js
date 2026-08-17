@@ -9,7 +9,7 @@
 // Commission is now a tiered flat-fee table (agreed with the business
 // team) instead of a flat percentage. Each daily savings amount maps
 // to a fixed monthly fee — it does NOT scale purely on total savings.
-import { supabase } from './supabase'
+import { supabaseAdmin } from './supabase'
 
 // Tiered commission table: { dailyAmount, fee }
 // Sorted ascending by dailyAmount. A trader's daily amount is matched
@@ -78,12 +78,15 @@ export function projectPlan(dailyAmount) {
 }
 
 export async function getActiveCycle(userId) {
-  const { data } = await supabase
+  const { data, error } = await supabaseAdmin
     .from('cycles')
     .select('*')
     .eq('user_id', userId)
     .eq('status', 'active')
     .single()
+  if (error && error.code !== 'PGRST116') {
+    console.error('getActiveCycle: Supabase error', userId, error)
+  }
   return data
 }
 
@@ -94,7 +97,7 @@ export async function startCycle(userId, dailyAmount) {
   }
   const totalSavings = dailyAmount * 30
   const commission = calculateCommission(dailyAmount)
-  const { data: cycle } = await supabase
+  const { data: cycle, error } = await supabaseAdmin
     .from('cycles')
     .insert([{
       user_id: userId,
@@ -105,6 +108,10 @@ export async function startCycle(userId, dailyAmount) {
     }])
     .select()
     .single()
+  if (error) {
+    console.error('startCycle: insert failed', userId, error)
+    throw new Error('Could not start your savings cycle. Please try again.')
+  }
   return cycle
 }
 
@@ -142,11 +149,14 @@ export function getBalanceSummary(cycle) {
 // Anchor deposit webhook is allowed to create a contribution row.
 export async function getTodaysContribution(cycleId) {
   const today = new Date().toISOString().split('T')[0]
-  const { data } = await supabase
+  const { data, error } = await supabaseAdmin
     .from('contributions')
     .select('id')
     .eq('cycle_id', cycleId)
     .eq('contribution_date', today)
     .single()
+  if (error && error.code !== 'PGRST116') {
+    console.error('getTodaysContribution: Supabase error', cycleId, error)
+  }
   return data
 }
