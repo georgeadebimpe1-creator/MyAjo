@@ -10,11 +10,12 @@
 // Uses supabaseAdmin (service role key), not the anon-key client. This
 // is server-only code (called from route.js, never the browser), and
 // RLS was silently blocking writes here under the anon key — same bug
-// as the Dojah webhook originally had. Every write below also checks
-// for an error instead of discarding it, so a blocked/failed write
-// shows up in logs instead of looking identical to a success.
+// as the Dojah webhook originally had. Every write below now also
+// checks for an error instead of discarding it, so a blocked/failed
+// write shows up in logs instead of looking identical to a success.
 import { supabaseAdmin } from './supabase'
-import { createAnchorCustomer, createAnchorDepositAccount } from './anchor'
+import { createAnchorCustomer, createAnchorDepositAccount, verifyAccountNumber, createCounterParty } from './anchor'
+import { resolveBankFromName } from './bankMatch'
 
 // Fetches the full set of fields any step in the app might need, so
 // every caller uses one consistent shape instead of hand-picking columns.
@@ -36,11 +37,7 @@ export async function getUserByWhatsapp(whatsapp) {
 
 // Used during onboarding (CONFIRM step) — creates a new trader record,
 // or updates an existing one if they're re-running onboarding.
-// `details` = { full_name, email, bank_name, bank_account_number, residential_address }
-// `residential_address` here is a plain readable string for record-keeping
-// (e.g. "12 Market Road, Ikeja, Lagos") — the structured version Anchor
-// actually needs is built separately and passed straight to
-// provisionAnchorAccount, not round-tripped through this column.
+// `details` = { full_name, email, bank_name, bank_account_number }
 export async function createOrUpdateAccount(whatsapp, details) {
   const existingUser = await getUserByWhatsapp(whatsapp)
 
@@ -52,7 +49,6 @@ export async function createOrUpdateAccount(whatsapp, details) {
         email: details.email,
         bank_name: details.bank_name,
         bank_account_number: details.bank_account_number,
-        residential_address: details.residential_address,
       })
       .eq('id', existingUser.id)
 
@@ -74,7 +70,6 @@ export async function createOrUpdateAccount(whatsapp, details) {
       bank_name: details.bank_name,
       bank_account_number: details.bank_account_number,
       bank_account_name: details.full_name,
-      residential_address: details.residential_address,
       status: 'active',
     }])
     .select()
@@ -101,30 +96,106 @@ export async function freezeAccount(userId) {
 }
 
 // ---------------------------------------------------------------------
+// Bank verification — resolves a trader-typed bank name to a real Anchor
+// bankCode, verifies the account number is real, and saves a Anchor
+// CounterParty so payout at cycle-end doesn't need any of this redone.
+// ---------------------------------------------------------------------
+//
+// Requires two new columns on `users` not used anywhere before this:
+// bank_code (text) and anchor_counterparty_id (text). Add these in
+// Supabase before this runs, or every call here will fail on the save.
+//
+// Returns one of three shapes — caller (route.js) branches on this:
+//   { verified: true, accountName, bankName }
+//   { needsSelection: true, candidates: [{ code, name }, ...] }
+//   { retype: true }   — nothing close matched at all
+export async function verifyAndLinkBankAccount(userId, typedBankName, accountNumber) {
+  const resolved = await resolveBankFromName(typedBankName)
+
+  if (!resolved.match) {
+    if (resolved.candidates.length === 0) {
+      return { retype: true }
+    }
+    return { needsSelection: true, candidates: resolved.candidates }
+  }
+
+  return await verifyAndLinkResolvedBank(userId, resolved.match, accountNumber)
+}
+
+// Second half of the flow — called directly once a bankCode is already
+// known, either because resolveBankFromName found a confident single
+// match, or because the trader picked one from a numbered list.
+export async function verifyAndLinkResolvedBank(userId, bank, accountNumber) {
+  let verified
+  try {
+    verified = await verifyAccountNumber(bank.code, accountNumber)
+  } catch (err) {
+    console.error('verifyAndLinkResolvedBank: account verification failed', userId, bank, accountNumber, err)
+    throw new Error(
+      "we couldn't verify that account number with the bank — please double check the number and try again"
+    )
+  }
+
+  let counterParty
+  try {
+    counterParty = await createCounterParty({
+      bankCode: bank.code,
+      accountName: verified.accountName,
+      accountNumber,
+    })
+  } catch (err) {
+    console.error('verifyAndLinkResolvedBank: counterparty creation failed', userId, bank, err)
+    throw new Error('we could not save that bank account — please try again')
+  }
+
+  const { error } = await supabaseAdmin
+    .from('users')
+    .update({
+      bank_name: bank.name,
+      bank_code: bank.code,
+      bank_account_number: accountNumber,
+      bank_account_name: counterParty.verifiedAccountName || verified.accountName,
+      anchor_counterparty_id: counterParty.counterPartyId,
+    })
+    .eq('id', userId)
+
+  if (error) {
+    console.error('verifyAndLinkResolvedBank: failed to save verified bank details', userId, error)
+    throw new Error('your bank account was verified but we hit an error saving it — please try again')
+  }
+
+  return {
+    verified: true,
+    accountName: counterParty.verifiedAccountName || verified.accountName,
+    bankName: bank.name,
+  }
+}
+
+// ---------------------------------------------------------------------
 // Anchor deposit account provisioning
 // ---------------------------------------------------------------------
 //
 // Creates a real, dedicated Anchor deposit account for a trader and
-// returns the account number Temi tells them to send money to.
+// returns the account number Temi should tell them to send money to.
+// Without this, a trader has no account number to save into, and the
+// deposit webhook has nothing reliable to match incoming transfers
+// against.
 //
-// STATUS: not yet tested against Anchor's sandbox. anchor.js is built
-// from Anchor's real documented examples (confirmed 2026-08-16), but
-// "matches the docs" and "works against a live sandbox response" are
-// two different things until it's actually been run once for real.
+// CONFIRMED (Anchor Slack, 2026): each trader should get their own
+// individual DepositAccount — not a shared/pooled account. This
+// function's architecture is correct as originally written.
+//
+// STATUS: not yet tested against Anchor's sandbox. anchor.js itself is
+// built strictly from Anchor's public docs (see comments in that file)
+// — not confirmed against a real response. Treat this whole function
+// as "should work in principle" until it's been run once for real.
 //
 // Idempotent: if this trader already has an anchor_account_id on file,
 // it's reused rather than creating a duplicate account at Anchor.
-//
-// `typedAddress` — the structured address the trader typed during
-// onboarding: { addressLine_1, city, state, postalCode, country }.
-// Dojah's own residential_address field came back empty in sandbox
-// testing (and is unreliable in general — many real BVN records lack
-// it), so address is no longer sourced from the Dojah-populated column
-// at all. It must be passed in here directly from the onboarding flow.
-export async function provisionAnchorAccount(userId, typedAddress) {
+export async function provisionAnchorAccount(userId) {
   const { data: user, error } = await supabaseAdmin
     .from('users')
-    .select('full_name, email, whatsapp_number, date_of_birth, gender, bvn, anchor_customer_id, anchor_account_id, anchor_account_number')
+    .select('full_name, email, whatsapp_number, date_of_birth, gender, residential_address, bvn, anchor_customer_id, anchor_account_id, anchor_account_number')
     .eq('id', userId)
     .single()
 
@@ -138,32 +209,25 @@ export async function provisionAnchorAccount(userId, typedAddress) {
     return { accountNumber: user.anchor_account_number }
   }
 
-  // date_of_birth, gender, and bvn only exist on the user record after
-  // Dojah verification succeeds. address now comes from the trader's
-  // own onboarding input, not the database.
+  // These only exist on the user record after Dojah verification
+  // succeeds. If any are missing, calling Anchor would fail anyway
+  // with a far less useful error — fail early with a clear reason.
   const missing = []
   if (!user.date_of_birth) missing.push('date of birth')
   if (!user.gender) missing.push('gender')
+  if (!user.residential_address) missing.push('address')
   if (!user.bvn) missing.push('BVN')
-  if (!typedAddress || !typedAddress.addressLine_1 || !typedAddress.state) missing.push('address')
   if (missing.length > 0) {
-    console.error('provisionAnchorAccount: missing required data', userId, missing)
+    console.error('provisionAnchorAccount: missing verification data', userId, missing)
     throw new Error(
       `your verification details look incomplete (missing ${missing.join(', ')}). Please contact support`
     )
   }
 
-  // date_of_birth is stored in a Postgres `date` column, which
-  // PostgREST/Supabase normally returns as ISO (YYYY-MM-DD) regardless
-  // of the format Dojah originally sent ("01-Jun-1982" in sandbox
-  // testing). This is a defensive fallback only, in case that
-  // assumption is ever wrong — it leaves an already-ISO date untouched.
-  const dob = formatDobIfNeeded(user.date_of_birth)
-
-  // Anchor's own documented example uses the plain local format
-  // ("07061234507"), matching whatsapp_number's existing internal
-  // format exactly — no conversion needed.
-  const phone = user.whatsapp_number
+  // Anchor's docs expect phone numbers in 234XXXXXXXXXX format.
+  // whatsapp_number is stored internally as 0XXXXXXXXXX. UNCONFIRMED —
+  // verify this is really the format Anchor wants before trusting it.
+  const phone = '234' + user.whatsapp_number.slice(1)
 
   let anchorCustomerId = user.anchor_customer_id
 
@@ -172,9 +236,14 @@ export async function provisionAnchorAccount(userId, typedAddress) {
       fullName: user.full_name,
       email: user.email,
       phone,
-      dob,
+      dob: user.date_of_birth,
       gender: user.gender,
-      address: typedAddress,
+      // anchor.js passes this straight through as `address`. Anchor's
+      // API very likely wants a structured object (addressLine1, city,
+      // state, country) rather than the single text string Dojah gives
+      // us — this is the part most likely to need fixing once tested
+      // against a real sandbox response.
+      address: user.residential_address,
       bvn: user.bvn,
     })
 
@@ -209,22 +278,4 @@ export async function provisionAnchorAccount(userId, typedAddress) {
   }
 
   return { accountNumber: account.accountNumber }
-}
-
-const MONTH_ABBREVIATIONS = {
-  Jan: '01', Feb: '02', Mar: '03', Apr: '04', May: '05', Jun: '06',
-  Jul: '07', Aug: '08', Sep: '09', Oct: '10', Nov: '11', Dec: '12',
-}
-
-function formatDobIfNeeded(raw) {
-  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
-    return raw // already ISO — the expected case
-  }
-  const match = /^(\d{2})-([A-Za-z]{3})-(\d{4})$/.exec(raw)
-  if (match) {
-    const [, day, monthAbbr, year] = match
-    const month = MONTH_ABBREVIATIONS[monthAbbr]
-    if (month) return `${year}-${month}-${day}`
-  }
-  return raw // unrecognized format — pass through so a failure is visible, not silently wrong
 }
