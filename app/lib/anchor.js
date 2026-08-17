@@ -38,10 +38,12 @@ async function createAnchorCustomer({ fullName, email, phone, dob, gender, addre
           fullName: { firstName, lastName },
           email,
           phoneNumber: phone,
-          dateOfBirth: dob,
-          gender,
           address,
-          identificationLevel2: { bvn },
+          // dateOfBirth, gender, and bvn belong together here — confirmed
+          // against Anchor's own documented example. This exact grouping
+          // was fixed once already; if you're reading this after another
+          // regression, that's the thing to check first.
+          identificationLevel2: { dateOfBirth: dob, gender, bvn },
         },
       },
     }),
