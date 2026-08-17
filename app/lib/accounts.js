@@ -236,10 +236,12 @@ export async function provisionAnchorAccount(userId, address) {
     )
   }
 
-  // Anchor's docs expect phone numbers in 234XXXXXXXXXX format.
-  // whatsapp_number is stored internally as 0XXXXXXXXXX. UNCONFIRMED —
-  // verify this is really the format Anchor wants before trusting it.
-  const phone = '234' + user.whatsapp_number.slice(1)
+  // CONFIRMED against Anchor's own documented example ("07061234507")
+  // — plain local format, same as whatsapp_number's existing internal
+  // format. No conversion needed. (This was previously miswritten as a
+  // 234-prefixed conversion — if you're reading this after another
+  // regression, that's the thing to check first.)
+  const phone = user.whatsapp_number
 
   let anchorCustomerId = user.anchor_customer_id
 
