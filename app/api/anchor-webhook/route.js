@@ -2,18 +2,36 @@ import { NextResponse } from 'next/server'
 import { supabase } from '../../lib/supabase'
 import { sendMessage } from '../../lib/whatsapp'
 import { getMessage } from '../../lib/messages'
-import { getWithdrawableBalance, processWithdrawal, stubPayout } from '../../lib/withdrawal'
+import { getWithdrawableBalance, processWithdrawal } from '../../lib/withdrawal'
+import { anchorPayout } from '../../lib/payout'
+import { updateSession } from '../../lib/session'
 
 export async function POST(request) {
   try {
     const payload = await request.json()
 
-    if (payload.data?.type !== 'payin.received') {
+    // CONFIRMED with Anchor (2026 Slack thread): three events fire per
+    // inbound transfer — nip.inbound.received, nip.inbound.settled, and
+    // nip.inbound.completed. Only 'completed' means the money is truly,
+    // finally the trader's — the other two can fire before funds are
+    // actually settled. Acting on any of the earlier ones risks
+    // crediting a trader's savings for money that hasn't cleared yet.
+    if (payload.data?.type !== 'nip.inbound.completed') {
       return new NextResponse('OK', { status: 200 })
     }
 
+    // Each trader has their own individual DepositAccount (confirmed
+    // architecture, not a shared/pooled one) — so this IS the correct
+    // per-trader identifier to match against anchor_account_id.
     const anchorAccountId = payload.data?.relationships?.account?.data?.id
-    const amount = payload.data?.attributes?.amount
+
+    // The amount is NOT on payload.data directly — it's on the included
+    // InboundNIPTransfer resource. Anchor's docs confirm amounts are in
+    // kobo (the smallest currency unit) for the transfer-creation API;
+    // treating inbound event amounts the same way until proven otherwise
+    // in a real sandbox test.
+    const transferResource = (payload.included || []).find(r => r.type === 'InboundNIPTransfer')
+    const amount = transferResource?.attributes?.amount
     const amountNaira = amount ? amount / 100 : null
 
     if (!anchorAccountId || !amountNaira) {
@@ -84,7 +102,14 @@ export async function POST(request) {
     if (newDays === 30) {
       const updatedCycle = { ...cycle, days_contributed: newDays, total_saved: newTotal }
       const withdrawableBalance = await getWithdrawableBalance(updatedCycle)
-      const result = await processWithdrawal(cycle.id, withdrawableBalance, stubPayout)
+      const result = await processWithdrawal(cycle.id, withdrawableBalance, anchorPayout)
+
+      if (result.success) {
+        // Leave the trader in 'cycle_complete' so a follow-up YES (which
+        // the message below explicitly asks for) is actually handled by
+        // route.js, instead of falling through to "I did not understand".
+        await updateSession(user.whatsapp_number, 'cycle_complete', {})
+      }
 
       const message = result.success
         ? getMessage('cycle_complete', 'en', {
