@@ -13,6 +13,7 @@
 
 import { supabaseAdmin } from './supabase'
 import { quoteWithdrawal } from './withdrawalLogic'
+import { sendAdminAlert } from './alerts'
 
 /**
  * Withdrawable balance = total_saved minus the locked commission minus
@@ -81,13 +82,15 @@ export async function processWithdrawal(cycleId, requestedAmount, payoutFn) {
     return { success: false, reason: freshQuote.reason }
   }
 
+  const commission = freshQuote.payoutType === 'cycle_completion' ? parseFloat(cycle.commission) : 0
+
   const { data: payout, error: insertErr } = await supabaseAdmin
     .from('payouts')
     .insert([{
       cycle_id: cycle.id,
       user_id: cycle.user_id,
       gross_amount: freshQuote.requestedAmount,
-      commission: freshQuote.payoutType === 'cycle_completion' ? cycle.commission : 0,
+      commission,
       net_amount: freshQuote.netAmount,
       payout_type: freshQuote.payoutType,
       withdrawal_fee: freshQuote.fee,
@@ -102,7 +105,7 @@ export async function processWithdrawal(cycleId, requestedAmount, payoutFn) {
     return { success: false, reason: 'Could not log this withdrawal. Please try again.' }
   }
 
-  const payoutResult = await payoutFn({ userId: cycle.user_id, amount: freshQuote.netAmount })
+  const payoutResult = await payoutFn({ userId: cycle.user_id, amount: freshQuote.netAmount, commission })
 
   if (!payoutResult.success) {
     const { error: failUpdateErr } = await supabaseAdmin
@@ -147,6 +150,10 @@ export async function processWithdrawal(cycleId, requestedAmount, payoutFn) {
       'processWithdrawal: PAYOUT SUCCEEDED but cycle update failed — needs manual reconciliation',
       { cycleId: cycle.id, payoutId: payout.id, cycleUpdate, error: cycleUpdateErr }
     )
+    await sendAdminAlert(
+      'Payout succeeded but cycle update failed',
+      `A payout went through but the cycle record could not be updated.\n\nCycle ID: ${cycle.id}\nPayout ID: ${payout.id}\nIntended update: ${JSON.stringify(cycleUpdate)}\nSupabase error: ${cycleUpdateErr.message || JSON.stringify(cycleUpdateErr)}\n\nThis needs manual reconciliation in Supabase — check the cycles table for this ID.`
+    )
   }
 
   const { error: payoutUpdateErr } = await supabaseAdmin
@@ -162,6 +169,10 @@ export async function processWithdrawal(cycleId, requestedAmount, payoutFn) {
     console.error(
       'processWithdrawal: PAYOUT SUCCEEDED but payout status update failed — needs manual reconciliation',
       { payoutId: payout.id, error: payoutUpdateErr }
+    )
+    await sendAdminAlert(
+      'Payout succeeded but payout status update failed',
+      `A payout went through but its own record could not be marked completed.\n\nPayout ID: ${payout.id}\nCycle ID: ${cycle.id}\nBank reference: ${payoutResult.bankReference || 'none'}\nSupabase error: ${payoutUpdateErr.message || JSON.stringify(payoutUpdateErr)}\n\nThis needs manual reconciliation in Supabase — check the payouts table for this ID, it likely still shows 'pending' even though the money moved.`
     )
   }
 
