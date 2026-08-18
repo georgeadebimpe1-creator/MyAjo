@@ -133,24 +133,29 @@ async function verifyAccountNumber(bankCode, accountNumber) {
 // on file at the other bank, regardless of what name we pass in — this is
 // the strongest guard against a mistyped account number.
 async function createCounterParty({ bankCode, accountName, accountNumber }) {
+  const requestBody = {
+    data: {
+      type: 'CounterParty',
+      attributes: {
+        bankCode,
+        accountName,
+        accountNumber,
+        verifyName: true,
+      },
+    },
+  }
+  // Logs the outgoing request whenever this fails, alongside the
+  // existing response log below — previously only the response was
+  // captured, which made it impossible to see the exact payload sent
+  // when reporting an error back to Anchor's support team.
   const response = await fetch(`${ANCHOR_API_URL}/counterparties`, {
     method: 'POST',
     headers: ANCHOR_HEADERS,
-    body: JSON.stringify({
-      data: {
-        type: 'CounterParty',
-        attributes: {
-          bankCode,
-          accountName,
-          accountNumber,
-          verifyName: true,
-        },
-      },
-    }),
+    body: JSON.stringify(requestBody),
   })
   const result = await response.json()
   if (!response.ok) {
-    console.error('Anchor createCounterParty failed:', response.status, JSON.stringify(result))
+    console.error('Anchor createCounterParty failed:', response.status, JSON.stringify(result), 'Request sent:', JSON.stringify(requestBody))
     throw new Error('Could not save that bank account with Anchor')
   }
   return {
