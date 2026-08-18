@@ -13,7 +13,12 @@
 // every CALLER of this file stays in Naira — consistent with the rest of
 // the app (see the UNITS note in route.js).
 export const ANCHOR_API_URL_UNUSED = null;
-const ANCHOR_API_URL = process.env.ANCHOR_API_URL || 'https://api.getanchor.co/api/v1'
+// Defaults to SANDBOX on purpose. If ANCHOR_API_URL is ever missing or
+// wiped from Vercel's env vars, this should fail safe toward test data,
+// not silently start hitting Anchor's production system. Production
+// use REQUIRES setting ANCHOR_API_URL explicitly in Vercel — it should
+// never rely on this fallback.
+const ANCHOR_API_URL = process.env.ANCHOR_API_URL || 'https://api.sandbox.getanchor.co/api/v1'
 const ANCHOR_API_KEY = process.env.ANCHOR_API_KEY
 
 const ANCHOR_HEADERS = {
