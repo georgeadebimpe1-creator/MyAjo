@@ -93,6 +93,39 @@ async function createAnchorDepositAccount(anchorCustomerId) {
   }
 }
 
+// Step 1b: Trigger KYC verification for a customer that was already
+// created. CONFIRMED against Anchor's docs (docs.getanchor.co/docs/
+// individual-customer-kyc) — passing bvn/dateOfBirth/gender at customer
+// CREATION time does NOT verify them; Anchor's own example response for
+// that case still comes back "verification": {"status": "unverified"}.
+// This separate call is required, and Anchor processes it async — the
+// real result (approved/error/rejected) arrives later as a webhook
+// event, not in this function's response. This function only confirms
+// Anchor *accepted* the verification request, not that it passed.
+async function verifyAnchorCustomerKyc(anchorCustomerId, { bvn, dob, gender }) {
+  const response = await fetch(`${ANCHOR_API_URL}/customers/${anchorCustomerId}/verification/individual`, {
+    method: 'POST',
+    headers: ANCHOR_HEADERS,
+    body: JSON.stringify({
+      data: {
+        type: 'Verification',
+        attributes: {
+          level: 'TIER_2',
+          level2: { bvn, dateOfBirth: dob, gender },
+        },
+      },
+    }),
+  })
+  const result = await response.json()
+  if (!response.ok) {
+    console.error('Anchor KYC verification request failed:', response.status, JSON.stringify(result))
+    throw new Error('Anchor KYC verification request failed')
+  }
+  // This just means Anchor accepted the request and will send a webhook
+  // (customer.identification.approved/error/rejected) with the real result.
+  return result
+}
+
 // CONFIRMED — GET /api/v1/banks. Returns the full list of banks Anchor
 // can send NIP transfers to, each with a nipCode used as bankCode
 // elsewhere in this file. Used by lib/bankMatch.js to resolve whatever
@@ -261,6 +294,7 @@ async function verifyTransfer(transferId) {
 export {
   createAnchorCustomer,
   createAnchorDepositAccount,
+  verifyAnchorCustomerKyc,
   listBanks,
   verifyAccountNumber,
   createCounterParty,
