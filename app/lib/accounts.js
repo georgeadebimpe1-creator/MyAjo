@@ -14,7 +14,7 @@
 // checks for an error instead of discarding it, so a blocked/failed
 // write shows up in logs instead of looking identical to a success.
 import { supabaseAdmin } from './supabase'
-import { createAnchorCustomer, createAnchorDepositAccount, verifyAnchorCustomerKyc, verifyAccountNumber, createCounterParty } from './anchor'
+import { createAnchorCustomer, createAnchorDepositAccount, verifyAnchorCustomerKyc, getAnchorCustomer, verifyAccountNumber, createCounterParty } from './anchor'
 import { resolveBankFromName } from './bankMatch'
 
 // Fetches the full set of fields any step in the app might need, so
@@ -351,4 +351,60 @@ export async function finalizeAnchorDepositAccount(userId) {
   }
 
   return { accountNumber: account.accountNumber }
-      }
+}
+
+// Fallback path — called from route.js whenever a trader interacts with
+// Temi while status is 'pending', so they get an active check instead
+// of only ever waiting on a webhook that might be slow or lost. Safe to
+// call repeatedly; does nothing destructive if still genuinely pending.
+//
+// Returns one of:
+//   { status: 'ready', accountNumber }
+//   { status: 'pending' }
+//   { status: 'rejected' }
+export async function checkAndFinalizeIfApproved(userId) {
+  const { data: user, error } = await supabaseAdmin
+    .from('users')
+    .select('anchor_customer_id, anchor_kyc_status, anchor_account_id, anchor_account_number')
+    .eq('id', userId)
+    .single()
+
+  if (error || !user) {
+    console.error('checkAndFinalizeIfApproved: could not load user', userId, error)
+    return { status: 'pending' }
+  }
+
+  // Already finished — covers both "webhook already handled it" and
+  // "an earlier poll already handled it".
+  if (user.anchor_account_id && user.anchor_account_number) {
+    return { status: 'ready', accountNumber: user.anchor_account_number }
+  }
+
+  if (!user.anchor_customer_id) {
+    return { status: 'pending' }
+  }
+
+  let customer
+  try {
+    customer = await getAnchorCustomer(user.anchor_customer_id)
+  } catch (err) {
+    console.error('checkAndFinalizeIfApproved: status check failed', userId, err)
+    return { status: 'pending' }
+  }
+
+  const verificationStatus = customer?.attributes?.verification?.status
+
+  if (!verificationStatus || verificationStatus === 'unverified' || verificationStatus === 'pending') {
+    return { status: 'pending' }
+  }
+
+  if (verificationStatus === 'rejected' || verificationStatus === 'failed') {
+    await supabaseAdmin.from('users').update({ anchor_kyc_status: 'rejected' }).eq('id', userId)
+    return { status: 'rejected' }
+  }
+
+  // Anything else (expected: "verified") — treat as approved and finish
+  // account creation right now instead of waiting further.
+  const account = await finalizeAnchorDepositAccount(userId)
+  return { status: 'ready', accountNumber: account.accountNumber }
+}
