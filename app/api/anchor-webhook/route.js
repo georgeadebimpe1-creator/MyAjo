@@ -4,7 +4,95 @@ import { sendMessage } from '../../lib/whatsapp'
 import { getMessage } from '../../lib/messages'
 import { getWithdrawableBalance, processWithdrawal } from '../../lib/withdrawal'
 import { anchorPayout } from '../../lib/payout'
-import { updateSession } from '../../lib/session'
+import { getSession, updateSession, clearSession } from '../../lib/session'
+import { finalizeAnchorDepositAccount } from '../../lib/accounts'
+import { startCycle } from '../../lib/savings'
+
+// Handles the three possible outcomes of the KYC verification triggered
+// during onboarding by provisionAnchorAccount(). Only 'approved' is
+// allowed to create the deposit account — see the "Customer does not
+// have kyc verification" error this whole flow exists to avoid.
+async function handleKycEvent(payload) {
+  const eventType = payload.data.type
+  const anchorCustomerId = payload.data?.relationships?.customer?.data?.id
+
+  if (!anchorCustomerId) {
+    console.error('Anchor KYC webhook: missing customer id', JSON.stringify(payload))
+    return new NextResponse('OK', { status: 200 })
+  }
+
+  const { data: user, error: userErr } = await supabaseAdmin
+    .from('users')
+    .select('id, full_name, whatsapp_number')
+    .eq('anchor_customer_id', anchorCustomerId)
+    .single()
+
+  if (userErr || !user) {
+    console.error('Anchor KYC webhook: no user found for customer', anchorCustomerId, userErr)
+    return new NextResponse('OK', { status: 200 })
+  }
+
+  if (eventType === 'customer.identification.error') {
+    // Anchor says: retry the verification later, this wasn't a hard no.
+    await supabaseAdmin.from('users').update({ anchor_kyc_status: null }).eq('id', user.id)
+    await sendMessage(
+      user.whatsapp_number,
+      `We hit a temporary issue verifying your details with our banking partner. Please type CONFIRM again in a moment to retry.`
+    )
+    return new NextResponse('OK', { status: 200 })
+  }
+
+  if (eventType === 'customer.identification.rejected') {
+    await supabaseAdmin.from('users').update({ anchor_kyc_status: 'rejected' }).eq('id', user.id)
+    await clearSession(user.whatsapp_number)
+    await sendMessage(
+      user.whatsapp_number,
+      `We could not verify your details with our banking partner. This usually happens if your name, phone number, or BVN details don't match. Please contact support at hello@myajo.com.ng and we will help sort this out.`
+    )
+    return new NextResponse('OK', { status: 200 })
+  }
+
+  // approved — safe to actually create the deposit account now.
+  let account
+  try {
+    account = await finalizeAnchorDepositAccount(user.id)
+  } catch (err) {
+    console.error('Anchor KYC webhook: finalizeAnchorDepositAccount failed', user.id, err)
+    await sendMessage(
+      user.whatsapp_number,
+      `Your verification was approved, but we hit an error setting up your account. Please contact support at hello@myajo.com.ng.`
+    )
+    return new NextResponse('OK', { status: 200 })
+  }
+
+  // Pick up the daily_amount that route.js stashed in session when it
+  // sent the trader into the "waiting on verification" state. Without
+  // this, the savings cycle never actually gets created even though the
+  // account now exists.
+  const session = await getSession(user.whatsapp_number)
+  const dailyAmount = session?.step === 'awaiting_kyc_approval' ? session.temp_data?.daily_amount : null
+
+  if (dailyAmount) {
+    await startCycle(user.id, dailyAmount)
+    await clearSession(user.whatsapp_number)
+    await sendMessage(
+      user.whatsapp_number,
+      `Your savings plan is now active!\n\n${user.full_name} your MyAjo journey has begun.\n\nSend your daily savings of N${parseFloat(dailyAmount).toLocaleString()} to this account:\n\nAccount Number: ${account.accountNumber}\n(This is your dedicated MyAjo savings account, held with our licensed banking partner.)\n\nWhen your transfer goes through, we will confirm it automatically. You can also type PAID anytime to check.\n\nGood luck and stay consistent!`
+    )
+  } else {
+    // Session was lost or this fired unexpectedly late — account exists
+    // but we don't know the daily amount to start a cycle with. Fail
+    // safe: tell the trader what's true (account ready) and ask them to
+    // pick up where they left off, rather than guessing an amount.
+    console.error('Anchor KYC webhook: approved but no pending daily_amount in session', user.id)
+    await sendMessage(
+      user.whatsapp_number,
+      `Good news ${user.full_name} — your account with our banking partner is now verified. Please type MENU and choose "Start Daily Savings" to finish setting up your plan.`
+    )
+  }
+
+  return new NextResponse('OK', { status: 200 })
+}
 
 export async function POST(request) {
   try {
@@ -13,6 +101,23 @@ export async function POST(request) {
     if (!supabaseAdmin) {
       console.error('Anchor webhook: SUPABASE_SERVICE_ROLE_KEY is not set, cannot write to database')
       return new NextResponse('Server misconfigured', { status: 500 })
+    }
+
+    // KYC verification result — arrives async, sometime after
+    // provisionAnchorAccount() triggered it during onboarding. This is
+    // a completely separate flow from the deposit/contribution logic
+    // below, so it's handled and returned here before anything else.
+    // NOT YET CONFIRMED against a real sandbox payload — built from
+    // Anchor's docs example, which shows type/relationships nested the
+    // same way as every other event in this file (under `data`). If
+    // this branch never fires during testing, log the raw payload once
+    // and check whether Anchor actually sends it flatter than this.
+    if (
+      payload.data?.type === 'customer.identification.approved' ||
+      payload.data?.type === 'customer.identification.error' ||
+      payload.data?.type === 'customer.identification.rejected'
+    ) {
+      return await handleKycEvent(payload)
     }
 
     // CONFIRMED with Anchor (2026 Slack thread): three events fire per
@@ -154,4 +259,4 @@ export async function POST(request) {
     console.error('Anchor webhook error:', error)
     return new NextResponse('Error', { status: 500 })
   }
-}
+                            }
