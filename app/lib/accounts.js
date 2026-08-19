@@ -14,7 +14,7 @@
 // checks for an error instead of discarding it, so a blocked/failed
 // write shows up in logs instead of looking identical to a success.
 import { supabaseAdmin } from './supabase'
-import { createAnchorCustomer, createAnchorDepositAccount, verifyAccountNumber, createCounterParty } from './anchor'
+import { createAnchorCustomer, createAnchorDepositAccount, verifyAnchorCustomerKyc, verifyAccountNumber, createCounterParty } from './anchor'
 import { resolveBankFromName } from './bankMatch'
 
 // Fetches the full set of fields any step in the app might need, so
@@ -187,25 +187,34 @@ export async function verifyAndLinkResolvedBank(userId, bank, accountNumber) {
 // individual DepositAccount — not a shared/pooled account. This
 // function's architecture is correct as originally written.
 //
-// STATUS: not yet tested against Anchor's sandbox. anchor.js itself is
-// built strictly from Anchor's public docs (see comments in that file)
-// — not confirmed against a real response. Treat this whole function
-// as "should work in principle" until it's been run once for real.
+// TWO-STEP FLOW (confirmed against Anchor's docs, docs.getanchor.co/
+// docs/individual-customer-kyc): creating a customer with BVN/DOB/
+// gender does NOT verify them — Anchor requires a separate verification
+// call, and the real result (approved/error/rejected) comes back later
+// as a WEBHOOK, not in the response to that call. So this function now
+// stops after triggering verification. The deposit account itself is
+// only created once the approved webhook arrives — see
+// finalizeAnchorDepositAccount() below, called from
+// app/api/anchor-webhook/route.js.
 //
-// Idempotent: if this trader already has an anchor_account_id on file,
-// it's reused rather than creating a duplicate account at Anchor.
+// Idempotent: reuses an existing anchor_customer_id, an existing
+// pending verification, or an existing deposit account rather than
+// re-triggering any step that's already been done.
 //
 // `address` is the STRUCTURED object built in route.js's
 // parseOnboardingDetails ({ addressLine_1, city, state, postalCode,
 // country }) — Anchor's customer-creation API needs this shape, not the
 // single display string stored in the users table for readability.
-// Passed in directly from the onboarding flow rather than re-read from
-// residential_address (which only holds the display string) since that
-// was the exact gap flagged as "most likely to need fixing" before.
+//
+// Returns one of:
+//   { status: 'ready', accountNumber }   — already fully provisioned
+//   { status: 'pending' }                — verification just triggered
+//                                           (or already awaiting Anchor's
+//                                           webhook from an earlier try)
 export async function provisionAnchorAccount(userId, address) {
   const { data: user, error } = await supabaseAdmin
     .from('users')
-    .select('full_name, email, whatsapp_number, date_of_birth, gender, bvn, anchor_customer_id, anchor_account_id, anchor_account_number')
+    .select('full_name, email, whatsapp_number, date_of_birth, gender, bvn, anchor_customer_id, anchor_kyc_status, anchor_account_id, anchor_account_number')
     .eq('id', userId)
     .single()
 
@@ -214,9 +223,15 @@ export async function provisionAnchorAccount(userId, address) {
     throw new Error('Could not load your details. Please try again or contact support.')
   }
 
-  // Already provisioned — reuse it instead of calling Anchor again.
+  // Already fully provisioned — reuse it instead of calling Anchor again.
   if (user.anchor_account_id && user.anchor_account_number) {
-    return { accountNumber: user.anchor_account_number }
+    return { status: 'ready', accountNumber: user.anchor_account_number }
+  }
+
+  // Verification already triggered and still waiting on Anchor's
+  // webhook — don't trigger it a second time.
+  if (user.anchor_kyc_status === 'pending') {
+    return { status: 'pending' }
   }
 
   // date_of_birth/gender/bvn only exist on the user record after Dojah
@@ -272,13 +287,58 @@ export async function provisionAnchorAccount(userId, address) {
     }
   }
 
-  const account = await createAnchorDepositAccount(anchorCustomerId)
+  // Trigger KYC verification. Anchor's real answer arrives later via
+  // webhook (customer.identification.approved / .error / .rejected).
+  await verifyAnchorCustomerKyc(anchorCustomerId, {
+    bvn: user.bvn,
+    dob: user.date_of_birth,
+    gender: user.gender,
+  })
+
+  const { error: kycErr } = await supabaseAdmin
+    .from('users')
+    .update({ anchor_kyc_status: 'pending' })
+    .eq('id', userId)
+
+  if (kycErr) {
+    console.error('provisionAnchorAccount: failed to save anchor_kyc_status', userId, kycErr)
+  }
+
+  return { status: 'pending' }
+}
+
+// Called from app/api/anchor-webhook/route.js when Anchor sends
+// customer.identification.approved. Only at this point is the trader
+// actually allowed to have a deposit account — calling this any earlier
+// is exactly what produced the "Customer does not have kyc verification"
+// error.
+//
+// Idempotent: if a deposit account already exists (e.g. Anchor resent
+// the same webhook), it's reused rather than duplicated.
+export async function finalizeAnchorDepositAccount(userId) {
+  const { data: user, error } = await supabaseAdmin
+    .from('users')
+    .select('anchor_customer_id, anchor_account_id, anchor_account_number')
+    .eq('id', userId)
+    .single()
+
+  if (error || !user) {
+    console.error('finalizeAnchorDepositAccount: could not load user', userId, error)
+    throw new Error('Could not load user to finish account setup')
+  }
+
+  if (user.anchor_account_id && user.anchor_account_number) {
+    return { accountNumber: user.anchor_account_number }
+  }
+
+  const account = await createAnchorDepositAccount(user.anchor_customer_id)
 
   const { error: acctErr } = await supabaseAdmin
     .from('users')
     .update({
       anchor_account_id: account.accountId,
       anchor_account_number: account.accountNumber,
+      anchor_kyc_status: 'approved',
     })
     .eq('id', userId)
 
@@ -286,9 +346,9 @@ export async function provisionAnchorAccount(userId, address) {
     // The account WAS created at Anchor at this point — money could
     // technically be sent to it — but we failed to save the number.
     // This needs a human, not a silent retry.
-    console.error('provisionAnchorAccount: account created at Anchor but failed to save', userId, account, acctErr)
-    throw new Error('your deposit account was created but we hit an error saving it — please contact support before making any transfer')
+    console.error('finalizeAnchorDepositAccount: account created at Anchor but failed to save', userId, account, acctErr)
+    throw new Error('deposit account was created but we hit an error saving it')
   }
 
   return { accountNumber: account.accountNumber }
-}
+      }
