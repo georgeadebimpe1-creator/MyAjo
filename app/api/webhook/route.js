@@ -254,17 +254,29 @@ async function handleMessage(from, body) {
         residential_address: temp.address_display,
       })
 
-      let anchorAccount
+      let anchorResult
       try {
-        anchorAccount = await provisionAnchorAccount(userId, temp.address)
+        anchorResult = await provisionAnchorAccount(userId, temp.address)
       } catch (err) {
         console.error('CONFIRM: Anchor provisioning failed', whatsapp, err)
         return `We hit a snag setting up your deposit account (${err.message}). Please type CONFIRM again in a moment — if it keeps happening, type HELP to reach support.`
       }
 
-      await startCycle(userId, temp.daily_amount)
-      await clearSession(whatsapp)
-      return `Your savings plan is now active!\n\n${temp.full_name} your MyAjo journey has begun.\n\nSend your daily savings of N${parseFloat(temp.daily_amount).toLocaleString()} to this account:\n\nAccount Number: ${anchorAccount.accountNumber}\n(This is your dedicated MyAjo savings account, held with our licensed banking partner.)\n\nWhen your transfer goes through, we will confirm it automatically. You can also type PAID anytime to check.\n\nGood luck and stay consistent!`
+      // Rare case: verification was already approved on an earlier
+      // attempt (e.g. trader retried CONFIRM after a network hiccup) —
+      // the account is ready right now, so activate immediately.
+      if (anchorResult.status === 'ready') {
+        await startCycle(userId, temp.daily_amount)
+        await clearSession(whatsapp)
+        return `Your savings plan is now active!\n\n${temp.full_name} your MyAjo journey has begun.\n\nSend your daily savings of N${parseFloat(temp.daily_amount).toLocaleString()} to this account:\n\nAccount Number: ${anchorResult.accountNumber}\n(This is your dedicated MyAjo savings account, held with our licensed banking partner.)\n\nWhen your transfer goes through, we will confirm it automatically. You can also type PAID anytime to check.\n\nGood luck and stay consistent!`
+      }
+
+      // Normal case: verification was just triggered and Anchor hasn't
+      // responded yet. Stash daily_amount in session so the webhook
+      // (app/api/anchor-webhook/route.js) can start the cycle itself
+      // once approval comes back — no cycle exists yet at this point.
+      await updateSession(whatsapp, 'awaiting_kyc_approval', { daily_amount: temp.daily_amount })
+      return `Thanks ${temp.full_name}! We're verifying your details with our banking partner now — this usually takes a few moments.\n\nWe'll message you here the second your savings account is ready. No need to do anything else for now.`
     }
     if (upper === 'EDIT') {
       await updateSession(whatsapp, 'onboarding', {})
@@ -276,6 +288,10 @@ async function handleMessage(from, body) {
       return `No problem. Type MENU whenever you are ready to start your savings plan.`
     }
     return `Please type CONFIRM to activate your plan, EDIT to fix your details, or CANCEL to start over.`
+  }
+
+  if (step === 'awaiting_kyc_approval') {
+    return `Still verifying your details with our banking partner — almost there. We'll message you here as soon as your savings account is ready.`
   }
 
   if (step === 'cycle_complete') {
