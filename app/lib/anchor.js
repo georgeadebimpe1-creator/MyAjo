@@ -126,6 +126,33 @@ async function verifyAnchorCustomerKyc(anchorCustomerId, { bvn, dob, gender }) {
   return result
 }
 
+// Fallback for when Anchor's webhook is slow or never arrives. NOT the
+// primary path — the webhook (customer.identification.approved, etc.)
+// is still what triggers this in normal operation. This exists so a
+// trader isn't stuck purely hoping a webhook shows up: called when they
+// re-interact with Temi while still "pending", to actively check
+// instead of only waiting.
+//
+// CONFIRMED endpoint exists (docs.getanchor.co/reference/fetch-customer
+// — GET /customers/{customerId}). NOT CONFIRMED: the exact string
+// Anchor uses for a passed verification. Their create-customer example
+// shows "verification": {"status": "unverified"} before any check runs
+// — this reads that same field afterward and treats anything other
+// than "unverified"/"pending" as approved. If this misfires in testing,
+// log the real response and adjust the check below.
+async function getAnchorCustomer(anchorCustomerId) {
+  const response = await fetch(`${ANCHOR_API_URL}/customers/${anchorCustomerId}`, {
+    method: 'GET',
+    headers: ANCHOR_HEADERS,
+  })
+  const result = await response.json()
+  if (!response.ok) {
+    console.error('Anchor getAnchorCustomer failed:', response.status, JSON.stringify(result))
+    throw new Error('Could not check verification status')
+  }
+  return result.data
+}
+
 // CONFIRMED — GET /api/v1/banks. Returns the full list of banks Anchor
 // can send NIP transfers to, each with a nipCode used as bankCode
 // elsewhere in this file. Used by lib/bankMatch.js to resolve whatever
@@ -295,10 +322,11 @@ export {
   createAnchorCustomer,
   createAnchorDepositAccount,
   verifyAnchorCustomerKyc,
+  getAnchorCustomer,
   listBanks,
   verifyAccountNumber,
   createCounterParty,
   initiateBookTransfer,
   initiateNipTransfer,
   verifyTransfer,
-}
+        }
