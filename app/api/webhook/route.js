@@ -379,4 +379,103 @@ async function handleMessage(from, body) {
 
     const user = await getUserByWhatsapp(whatsapp)
     if (!user) {
-      return `I could not find your account. Type MENU to get start
+      return `I could not find your account. Type MENU to get start    }
+ 
+    const cycle = await getActiveCycle(user.id)
+    if (!cycle) {
+      return `You do not have an active savings cycle. Type 1 to start one.`
+    }
+ 
+    if (isNaN(amount)) {
+      return `To withdraw, send WITHDRAW followed by the amount.\n\nExample: WITHDRAW 5000`
+    }
+ 
+    const quote = await quoteWithdrawalForCycle(cycle, amount)
+    if (!quote.allowed) {
+      return quote.reason
+    }
+ 
+    await updateSession(whatsapp, 'awaiting_withdrawal_confirmation', {
+      cycleId: cycle.id,
+      requestedAmount: quote.requestedAmount,
+    })
+    return quote.confirmationMessage
+  }
+ 
+  if (upper === 'YES' && step === 'awaiting_withdrawal_confirmation') {
+    const result = await processWithdrawal(temp.cycleId, temp.requestedAmount, anchorPayout)
+ 
+    if (!result.success) {
+      await clearSession(whatsapp)
+      return `Withdrawal could not be completed: ${result.reason}`
+    }
+ 
+    if (result.cycleEnded) {
+      await updateSession(whatsapp, 'cycle_complete', {})
+      return `N${result.netAmount.toLocaleString()} is on its way to your account.\n\nYour savings cycle has ended.\n\nReady to begin your next cycle? Type YES.`
+    }
+ 
+    await clearSession(whatsapp)
+    return `N${result.netAmount.toLocaleString()} is on its way to your account.`
+  }
+ 
+  if (upper === 'NO' && step === 'awaiting_withdrawal_confirmation') {
+    await clearSession(whatsapp)
+    return `Withdrawal cancelled. Your savings are untouched.`
+  }
+ 
+  if (upper === 'FREEZE') {
+    const user = await getUserByWhatsapp(whatsapp)
+    if (!user) {
+      return `I could not find your account. Please contact support immediately.`
+    }
+ 
+    await freezeAccount(user.id)
+    return `Your MyAjo account has been frozen immediately ${user.full_name}. No transactions can be made until you contact our support team to unfreeze it.\n\nContact us at hello@myajo.com.ng or call 08029708278.`
+  }
+ 
+  if (upper === 'HELP') {
+    return `Temi Commands\n\nMENU - Return to main menu\nBALANCE - Check your savings\nPAID - Confirm today's transfer has gone through\nWITHDRAW 5000 - Withdraw an amount from your savings (available from day 10)\nFREEZE - Freeze your account\nHELP - Show this menu\n\nWithdrawing before your 30 day cycle ends attracts a small charge from our banking partner (N50 up to N10,000, N100 above that). MyAjo never adds anything on top. Complete the full cycle and there is no charge at all.\n\nFor support contact hello@myajo.com.ng`
+  }
+ 
+  return `I did not understand that. Type MENU to see your options or HELP to see all commands.`
+}
+ 
+export async function GET(request) {
+  const { searchParams } = new URL(request.url)
+  const mode = searchParams.get('hub.mode')
+  const token = searchParams.get('hub.verify_token')
+  const challenge = searchParams.get('hub.challenge')
+ 
+  if (mode === 'subscribe' && token === META_VERIFY_TOKEN) {
+    return new NextResponse(challenge, { status: 200 })
+  }
+ 
+  return new NextResponse('Verification failed', { status: 403 })
+}
+ 
+export async function POST(request) {
+  try {
+    const payload = await request.json()
+    const entry = payload.entry?.[0]
+    const change = entry?.changes?.[0]
+    const message = change?.value?.messages?.[0]
+ 
+    if (!message || message.type !== 'text') {
+      return new NextResponse('OK', { status: 200 })
+    }
+ 
+    const from = message.from
+    const body = message.text.body
+ 
+    const responseText = await handleMessage(from, body)
+    if (responseText) {
+      await sendMessage(from, responseText)
+    }
+ 
+    return new NextResponse('OK', { status: 200 })
+  } catch (error) {
+    console.error('Webhook error:', error)
+    return new NextResponse('Error', { status: 500 })
+  }
+        }
