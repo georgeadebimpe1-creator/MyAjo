@@ -6,7 +6,7 @@ import { getWithdrawableBalance, processWithdrawal } from '../../lib/withdrawal'
 import { anchorPayout } from '../../lib/payout'
 import { getSession, updateSession, clearSession } from '../../lib/session'
 import { finalizeAnchorDepositAccount } from '../../lib/accounts'
-import { startCycle } from '../../lib/savings'
+import { startCycle, getActiveCycle } from '../../lib/savings'
 
 // Handles the three possible outcomes of the KYC verification triggered
 // during onboarding by provisionAnchorAccount(). Only 'approved' is
@@ -80,10 +80,18 @@ async function handleKycEvent(payload) {
       `Your savings plan is now active!\n\n${user.full_name} your MyAjo journey has begun.\n\nSend your daily savings of N${parseFloat(dailyAmount).toLocaleString()} to this account:\n\nAccount Number: ${account.accountNumber}\n(This is your dedicated MyAjo savings account, held with our licensed banking partner.)\n\nWhen your transfer goes through, we will confirm it automatically. You can also type PAID anytime to check.\n\nGood luck and stay consistent!`
     )
   } else {
-    // Session was lost or this fired unexpectedly late — account exists
-    // but we don't know the daily amount to start a cycle with. Fail
-    // safe: tell the trader what's true (account ready) and ask them to
-    // pick up where they left off, rather than guessing an amount.
+    // Session is gone — most likely because the trader's own poll
+    // (checkAndFinalizeIfApproved, triggered when they re-interacted
+    // with Temi) already finished this exact job before this webhook
+    // arrived. finalizeAnchorDepositAccount() above is idempotent, so
+    // that's harmless — but check for an active cycle before messaging,
+    // so we don't send a confusing duplicate on top of what polling
+    // already told them.
+    const alreadyHandled = await getActiveCycle(user.id)
+    if (alreadyHandled) {
+      return new NextResponse('OK', { status: 200 })
+    }
+
     console.error('Anchor KYC webhook: approved but no pending daily_amount in session', user.id)
     await sendMessage(
       user.whatsapp_number,
@@ -259,4 +267,4 @@ export async function POST(request) {
     console.error('Anchor webhook error:', error)
     return new NextResponse('Error', { status: 500 })
   }
-                            }
+}
