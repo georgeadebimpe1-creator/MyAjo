@@ -379,9 +379,9 @@ async function handleMessage(from, body) {
 
     const user = await getUserByWhatsapp(whatsapp)
     if (!user) {
-      return `I could not find your account. Type MENU to get start
-      }
- 
+      return `I could not find your account. Type MENU to get started.`
+    }
+
     const cycle = await getActiveCycle(user.id)
     if (!cycle) {
       return `You do not have an active savings cycle. Type 1 to start one.`
@@ -480,4 +480,3 @@ export async function POST(request) {
     return new NextResponse('Error', { status: 500 })
   }
         }
- 
