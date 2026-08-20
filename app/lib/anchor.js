@@ -33,31 +33,33 @@ const ANCHOR_HEADERS = {
 async function createAnchorCustomer({ fullName, email, phone, dob, gender, address, bvn }) {
   const [firstName, ...rest] = fullName.trim().split(' ')
   const lastName = rest.join(' ') || firstName
+  const requestBody = {
+    data: {
+      type: 'IndividualCustomer',
+      attributes: {
+        fullName: { firstName, lastName },
+        email,
+        phoneNumber: phone,
+        address,
+        // dateOfBirth, gender, and bvn belong together here — confirmed
+        // against Anchor's own documented example. This exact grouping
+        // was fixed once already; if you're reading this after another
+        // regression, that's the thing to check first.
+        identificationLevel2: { dateOfBirth: dob, gender, bvn },
+      },
+    },
+  }
   const response = await fetch(`${ANCHOR_API_URL}/customers`, {
     method: 'POST',
     headers: ANCHOR_HEADERS,
-    body: JSON.stringify({
-      data: {
-        type: 'IndividualCustomer',
-        attributes: {
-          fullName: { firstName, lastName },
-          email,
-          phoneNumber: phone,
-          address,
-          // dateOfBirth, gender, and bvn belong together here — confirmed
-          // against Anchor's own documented example. This exact grouping
-          // was fixed once already; if you're reading this after another
-          // regression, that's the thing to check first.
-          identificationLevel2: { dateOfBirth: dob, gender, bvn },
-        },
-      },
-    }),
+    body: JSON.stringify(requestBody),
   })
   const result = await response.json()
   if (!response.ok) {
-    console.error('Anchor customer creation failed:', response.status, JSON.stringify(result))
+    console.error('Anchor customer creation failed:', response.status, JSON.stringify(result), 'Request sent:', JSON.stringify(requestBody))
     throw new Error('Anchor customer creation failed')
   }
+  console.log('Anchor customer created:', JSON.stringify(result), 'Request sent:', JSON.stringify(requestBody))
   return result.data.id // Anchor's customer ID
 }
 
@@ -65,24 +67,26 @@ async function createAnchorCustomer({ fullName, email, phone, dob, gender, addre
 // CONFIRMED (2026 Slack thread with Anchor): each trader gets their own
 // individual DepositAccount — this was the right architecture all along.
 async function createAnchorDepositAccount(anchorCustomerId) {
+  const requestBody = {
+    data: {
+      type: 'DepositAccount',
+      attributes: { productName: 'SAVINGS' },
+      relationships: {
+        customer: { data: { id: anchorCustomerId, type: 'IndividualCustomer' } },
+      },
+    },
+  }
   const response = await fetch(`${ANCHOR_API_URL}/accounts`, {
     method: 'POST',
     headers: ANCHOR_HEADERS,
-    body: JSON.stringify({
-      data: {
-        type: 'DepositAccount',
-        attributes: { productName: 'SAVINGS' },
-        relationships: {
-          customer: { data: { id: anchorCustomerId, type: 'IndividualCustomer' } },
-        },
-      },
-    }),
+    body: JSON.stringify(requestBody),
   })
   const result = await response.json()
   if (!response.ok) {
-    console.error('Anchor account creation failed:', response.status, JSON.stringify(result))
+    console.error('Anchor account creation failed:', response.status, JSON.stringify(result), 'Request sent:', JSON.stringify(requestBody))
     throw new Error('Anchor account creation failed')
   }
+  console.log('Anchor deposit account created:', JSON.stringify(result), 'Request sent:', JSON.stringify(requestBody))
   // NOTE: Anchor's docs say this can be async (202 response) — the account
   // number may not be available immediately. Worth checking in sandbox
   // whether it comes back right away or needs a follow-up GET request.
@@ -103,24 +107,29 @@ async function createAnchorDepositAccount(anchorCustomerId) {
 // event, not in this function's response. This function only confirms
 // Anchor *accepted* the verification request, not that it passed.
 async function verifyAnchorCustomerKyc(anchorCustomerId, { bvn, dob, gender }) {
+  const requestBody = {
+    data: {
+      type: 'Verification',
+      attributes: {
+        level: 'TIER_2',
+        level2: { bvn, dateOfBirth: dob, gender },
+      },
+    },
+  }
   const response = await fetch(`${ANCHOR_API_URL}/customers/${anchorCustomerId}/verification/individual`, {
     method: 'POST',
     headers: ANCHOR_HEADERS,
-    body: JSON.stringify({
-      data: {
-        type: 'Verification',
-        attributes: {
-          level: 'TIER_2',
-          level2: { bvn, dateOfBirth: dob, gender },
-        },
-      },
-    }),
+    body: JSON.stringify(requestBody),
   })
   const result = await response.json()
   if (!response.ok) {
-    console.error('Anchor KYC verification request failed:', response.status, JSON.stringify(result))
+    console.error('Anchor KYC verification request failed:', response.status, JSON.stringify(result), 'Request sent:', JSON.stringify(requestBody))
     throw new Error('Anchor KYC verification request failed')
   }
+  // Logged on success too now, not just failure — this is the call
+  // Anchor's own team has asked to see the exact request/response for
+  // more than once already, and previously only failures were captured.
+  console.log('Anchor KYC verification accepted:', JSON.stringify(result), 'Request sent:', JSON.stringify(requestBody))
   // This just means Anchor accepted the request and will send a webhook
   // (customer.identification.approved/error/rejected) with the real result.
   return result
