@@ -106,6 +106,15 @@ export async function POST(request) {
   try {
     const payload = await request.json()
 
+    // Logs the event type on every single incoming call, before any
+    // filtering below — added because the filters further down (only
+    // acting on nip.inbound.completed, only known KYC event types)
+    // silently drop anything else with zero logging. That's correct
+    // caution for production, but it means we currently have no way to
+    // see what Anchor's sandbox "Simulate Transfer" feature actually
+    // sends. This line is the fix for that blind spot.
+    console.log('Anchor webhook received:', payload.data?.type, JSON.stringify(payload))
+
     if (!supabaseAdmin) {
       console.error('Anchor webhook: SUPABASE_SERVICE_ROLE_KEY is not set, cannot write to database')
       return new NextResponse('Server misconfigured', { status: 500 })
