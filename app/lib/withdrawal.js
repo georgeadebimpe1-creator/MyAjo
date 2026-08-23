@@ -14,6 +14,7 @@
 import { supabaseAdmin } from './supabase'
 import { quoteWithdrawal } from './withdrawalLogic'
 import { sendAdminAlert } from './alerts'
+import { getCycleDayNumber } from './savings'
 
 /**
  * Withdrawable balance = total_saved minus the locked commission minus
@@ -47,7 +48,7 @@ export async function quoteWithdrawalForCycle(cycle, requestedAmount) {
   const withdrawableBalance = await getWithdrawableBalance(cycle)
   return quoteWithdrawal({
     requestedAmount,
-    daysContributed: cycle.days_contributed,
+    cycleDayNumber: getCycleDayNumber(cycle.start_date),
     withdrawableBalance,
   })
 }
@@ -74,7 +75,7 @@ export async function processWithdrawal(cycleId, requestedAmount, payoutFn) {
   const withdrawableBalance = await getWithdrawableBalance(cycle)
   const freshQuote = quoteWithdrawal({
     requestedAmount,
-    daysContributed: cycle.days_contributed,
+    cycleDayNumber: getCycleDayNumber(cycle.start_date),
     withdrawableBalance,
   })
 
