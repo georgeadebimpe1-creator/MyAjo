@@ -137,29 +137,28 @@ export async function POST(request) {
       return await handleKycEvent(payload)
     }
 
-    // CONFIRMED with Anchor (2026 Slack thread): three events fire per
-    // inbound transfer — nip.inbound.received, nip.inbound.settled, and
-    // nip.inbound.completed. Only 'completed' means the money is truly,
-    // finally the trader's — the other two can fire before funds are
-    // actually settled. Acting on any of the earlier ones risks
-    // crediting a trader's savings for money that hasn't cleared yet.
-    if (payload.data?.type !== 'nip.inbound.completed') {
+    // CONFIRMED against a real sandbox payload (2026-08-23): the
+    // previously assumed event names (nip.inbound.received/settled/
+    // completed) do NOT match what Anchor actually sends. A real
+    // Simulate Transfer produced three different events instead —
+    // payment.received, transaction.created, payment.settled, in that
+    // order. 'payment.settled' is the one that carries a final,
+    // confirmed amount and the receiving account — acting on the
+    // earlier 'payment.received' risks crediting a trader before the
+    // transfer is actually finalized, same caution as before, just
+    // against the real event name this time instead of a guessed one.
+    if (payload.data?.type !== 'payment.settled') {
       return new NextResponse('OK', { status: 200 })
     }
 
-    // Each trader has their own individual DepositAccount (confirmed
-    // architecture, not a shared/pooled one) — so this IS the correct
-    // per-trader identifier to match against anchor_account_id.
-    const anchorAccountId = payload.data?.relationships?.account?.data?.id
-
-    // The amount is NOT on payload.data directly — it's on the included
-    // InboundNIPTransfer resource. Anchor's docs confirm amounts are in
-    // kobo (the smallest currency unit) for the transfer-creation API;
-    // treating inbound event amounts the same way until proven otherwise
-    // in a real sandbox test.
-    const transferResource = (payload.included || []).find(r => r.type === 'InboundNIPTransfer')
-    const amount = transferResource?.attributes?.amount
-    const amountNaira = amount ? amount / 100 : null
+    // Real payload shape, confirmed 2026-08-23 — completely different
+    // from the previously assumed 'included' array with an
+    // InboundNIPTransfer resource. Everything needed is nested directly
+    // under attributes.payment instead.
+    const payment = payload.data?.attributes?.payment
+    const anchorAccountId = payment?.settlementAccount?.accountId
+    const amountKobo = payment?.amount
+    const amountNaira = amountKobo ? amountKobo / 100 : null
 
     if (!anchorAccountId || !amountNaira) {
       console.error('Anchor webhook: missing account or amount', JSON.stringify(payload))
