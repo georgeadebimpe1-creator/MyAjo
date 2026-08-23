@@ -198,20 +198,108 @@ export async function POST(request) {
     }
 
     const today = new Date().toISOString().split('T')[0]
+    const paymentReference = payment?.paymentReference || null
 
-    // Same-day duplicate guard — without this, a retried or repeated
-    // Anchor webhook event could record the same deposit twice and
-    // inflate the trader's savings total.
-    const { data: alreadyPaid } = await supabaseAdmin
+    // FIXED 2026-08-23: this guard previously checked "any contribution
+    // recorded today for this cycle" — which meant a trader making TWO
+    // genuine deposits on the same day (e.g. their normal daily amount,
+    // plus a separate top-up or catch-up payment) would have their
+    // second payment silently dropped after money had already left
+    // their account, with no record and no notification. Confirmed
+    // directly: a second real ₦20,000 transfer was ignored because a
+    // ₦2,000 contribution already existed for that date.
+    //
+    // Now keyed on Anchor's paymentReference instead, which is unique
+    // per bank transfer. This still correctly skips a true duplicate
+    // webhook delivery (Anchor retrying the same event), but no longer
+    // blocks a second distinct real deposit on the same calendar day.
+    if (!paymentReference) {
+      // Extremely defensive — Anchor's payload always includes this in
+      // practice, but if it's ever missing we can't safely dedupe, so
+      // log loudly and manual reconciliation catches it via the
+      // duplicate-contribution check that would otherwise apply.
+      console.error('Anchor webhook: payment.settled event missing paymentReference — cannot dedupe safely', JSON.stringify(payload))
+    } else {
+      const { data: alreadyPaid } = await supabaseAdmin
+        .from('contributions')
+        .select('id')
+        .eq('cycle_id', cycle.id)
+        .eq('payment_reference', paymentReference)
+        .single()
+
+      if (alreadyPaid) {
+        console.log('Anchor webhook: this exact payment was already recorded (duplicate webhook delivery)', { userId: user.id, paymentReference })
+        return new NextResponse('OK', { status: 200 })
+      }
+    }
+
+    // RULE (2026-08-23): only the exact daily_amount chosen at onboarding
+    // is accepted — no top-ups. Compared in kobo to avoid float rounding
+    // issues (e.g. 2000.0000001 !== 2000). A wrong amount is real money
+    // that landed at Anchor, so it's flagged for manual reconciliation
+    // and the trader is told directly, rather than silently dropped or
+    // silently accepted at the wrong amount.
+    const expectedKobo = Math.round(parseFloat(cycle.daily_amount) * 100)
+    if (amountKobo !== expectedKobo) {
+      console.error('Anchor webhook: payment amount does not match daily_amount — needs manual reconciliation', {
+        userId: user.id,
+        cycleId: cycle.id,
+        expectedNaira: cycle.daily_amount,
+        receivedNaira: amountNaira,
+        paymentReference,
+      })
+      await sendMessage(
+        user.whatsapp_number,
+        `We received a transfer of N${amountNaira.toLocaleString()}, but your daily savings amount is N${parseFloat(cycle.daily_amount).toLocaleString()}. This payment has not been recorded yet — please contact support at hello@myajo.com.ng so we can sort this out for you.`
+      )
+      return new NextResponse('OK', { status: 200 })
+    }
+
+    // RULE (2026-08-23): missed-day catch-up. A trader who misses a day
+    // may send a second correct-amount payment the next day to cover it
+    // — but only one catch-up, and only for a genuinely missed day, not
+    // as an extra top-up. Enforced as: at most 2 contributions per
+    // calendar day for a cycle, and a 2nd is only allowed if yesterday
+    // has zero contributions recorded (proof a day was actually missed).
+    // Note: on a trader's very first day this can't yet distinguish "day
+    // 1, no prior day exists" from "a day was missed" — a low-risk edge
+    // case flagged here rather than silently handled, since fixing it
+    // properly needs the cycle's fixed start date (see the planned
+    // 30-calendar-day cycle work).
+    const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().split('T')[0]
+
+    const { count: todayCount } = await supabaseAdmin
       .from('contributions')
-      .select('id')
+      .select('id', { count: 'exact', head: true })
       .eq('cycle_id', cycle.id)
       .eq('contribution_date', today)
-      .single()
 
-    if (alreadyPaid) {
-      console.log('Anchor webhook: contribution already recorded today for user', user.id)
+    if ((todayCount || 0) >= 2) {
+      console.error('Anchor webhook: 3rd+ contribution attempt in one day rejected — needs manual reconciliation', { userId: user.id, cycleId: cycle.id, paymentReference })
+      await sendMessage(
+        user.whatsapp_number,
+        `We received another transfer of N${amountNaira.toLocaleString()}, but today's savings (including a missed-day catch-up) are already fully recorded. This payment has not been recorded yet — please contact support at hello@myajo.com.ng.`
+      )
       return new NextResponse('OK', { status: 200 })
+    }
+
+    if ((todayCount || 0) === 1) {
+      const { count: yesterdayCount } = await supabaseAdmin
+        .from('contributions')
+        .select('id', { count: 'exact', head: true })
+        .eq('cycle_id', cycle.id)
+        .eq('contribution_date', yesterday)
+
+      if ((yesterdayCount || 0) > 0) {
+        console.error('Anchor webhook: unauthorized top-up rejected — yesterday already covered', { userId: user.id, cycleId: cycle.id, paymentReference })
+        await sendMessage(
+          user.whatsapp_number,
+          `We received another transfer of N${amountNaira.toLocaleString()}, but today's savings are already recorded and there is no missed day to make up for. This payment has not been recorded yet — please contact support at hello@myajo.com.ng.`
+        )
+        return new NextResponse('OK', { status: 200 })
+      }
+      // else: yesterday has zero contributions — this is a legitimate
+      // catch-up for a missed day, allow it through.
     }
 
     const { error: insertErr } = await supabaseAdmin.from('contributions').insert([{
@@ -219,6 +307,7 @@ export async function POST(request) {
       user_id: user.id,
       amount: amountNaira,
       contribution_date: today,
+      payment_reference: paymentReference,
       verified: true,
       contribution_type: 'daily',
     }])
