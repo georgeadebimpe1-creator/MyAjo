@@ -21,17 +21,21 @@ export const EARLY_FEE_LOW = 50
 export const EARLY_FEE_HIGH = 100
 export const FEE_THRESHOLD = 10000
 
-export function isWithdrawalUnlocked(daysContributed) {
-  return daysContributed >= MIN_DAYS_BEFORE_WITHDRAWAL
+// NOTE: these all take cycleDayNumber (the trader's calendar day within
+// the fixed 30-day cycle, from cycles.start_date) — not days_contributed
+// (a count of payments). A cycle is calendar-bound: it unlocks and
+// completes on schedule regardless of how many payments actually landed.
+export function isWithdrawalUnlocked(cycleDayNumber) {
+  return cycleDayNumber >= MIN_DAYS_BEFORE_WITHDRAWAL
 }
 
-export function isCycleComplete(daysContributed) {
-  return daysContributed >= CYCLE_DAYS
+export function isCycleComplete(cycleDayNumber) {
+  return cycleDayNumber >= CYCLE_DAYS
 }
 
-export function calculateWithdrawalFee({ requestedAmount, daysContributed, withdrawableBalance }) {
+export function calculateWithdrawalFee({ requestedAmount, cycleDayNumber, withdrawableBalance }) {
   const isFullWithdrawal = requestedAmount >= withdrawableBalance
-  const isNaturalCompletion = isCycleComplete(daysContributed) && isFullWithdrawal
+  const isNaturalCompletion = isCycleComplete(cycleDayNumber) && isFullWithdrawal
 
   if (isNaturalCompletion) {
     return {
@@ -62,11 +66,11 @@ export function calculateWithdrawalFee({ requestedAmount, daysContributed, withd
  * Full pre-check. This is what gets shown to the trader BEFORE anything is
  * deducted — she must see this and reply YES before money moves.
  */
-export function quoteWithdrawal({ requestedAmount, daysContributed, withdrawableBalance }) {
-  if (!isWithdrawalUnlocked(daysContributed)) {
+export function quoteWithdrawal({ requestedAmount, cycleDayNumber, withdrawableBalance }) {
+  if (!isWithdrawalUnlocked(cycleDayNumber)) {
     return {
       allowed: false,
-      reason: `Withdrawals unlock after day ${MIN_DAYS_BEFORE_WITHDRAWAL} of your cycle. You are currently on day ${daysContributed}.`,
+      reason: `Withdrawals unlock after day ${MIN_DAYS_BEFORE_WITHDRAWAL} of your cycle. You are currently on day ${cycleDayNumber}.`,
     }
   }
 
@@ -83,7 +87,7 @@ export function quoteWithdrawal({ requestedAmount, daysContributed, withdrawable
 
   const { fee, feeReason, payoutType } = calculateWithdrawalFee({
     requestedAmount,
-    daysContributed,
+    cycleDayNumber,
     withdrawableBalance,
   })
 
