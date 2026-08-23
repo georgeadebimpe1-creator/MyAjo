@@ -12,12 +12,6 @@
 // For a partial/early withdrawal (commission === 0, since commission is
 // only charged at full cycle completion — see withdrawal.js), only the
 // NIP transfer happens.
-//
-// STATUS: not yet tested against Anchor's sandbox. Built from Anchor's
-// confirmed transfer docs (amount in kobo, BookTransfer supports
-// DepositAccount-to-DepositAccount, NIPTransfer requires a CounterParty)
-// — the endpoint shapes are confirmed, but this exact flow hasn't been
-// run against a real account yet.
 import { supabaseAdmin } from './supabase'
 import { initiateBookTransfer, initiateNipTransfer, verifyTransfer } from './anchor'
 
@@ -28,12 +22,16 @@ const ANCHOR_MASTER_ACCOUNT_ID = process.env.ANCHOR_MASTER_ACCOUNT_ID
  * @param {string} params.userId - trader's Supabase user id
  * @param {number} params.amount - NET amount (after commission) to pay out, in Naira
  * @param {number} [params.commission] - commission to sweep, in Naira. 0/omitted for partial withdrawals.
- * @returns {Promise<{ success: boolean, bankReference?: string, reason?: string }>}
+ * @param {boolean} [params.skipCommissionSweep] - true if a PRIOR attempt for this
+ *   same cycle already swept the commission successfully (e.g. the NIP transfer
+ *   failed afterward and this is a retry). Prevents double-charging the trader's
+ *   commission on retry — see withdrawal.js for how this is determined.
+ * @returns {Promise<{ success: boolean, bankReference?: string, reason?: string, commissionSwept: boolean }>}
  */
-export async function anchorPayout({ userId, amount, commission = 0 }) {
+export async function anchorPayout({ userId, amount, commission = 0, skipCommissionSweep = false }) {
   if (!ANCHOR_MASTER_ACCOUNT_ID) {
     console.error('anchorPayout: ANCHOR_MASTER_ACCOUNT_ID is not set')
-    return { success: false, reason: 'Payout is not fully configured yet. Please contact support.' }
+    return { success: false, reason: 'Payout is not fully configured yet. Please contact support.', commissionSwept: false }
   }
 
   const { data: user, error } = await supabaseAdmin
@@ -44,17 +42,17 @@ export async function anchorPayout({ userId, amount, commission = 0 }) {
 
   if (error || !user) {
     console.error('anchorPayout: could not load user', userId, error)
-    return { success: false, reason: 'Could not load your account details.' }
+    return { success: false, reason: 'Could not load your account details.', commissionSwept: false }
   }
 
   if (!user.anchor_account_id) {
     console.error('anchorPayout: user has no anchor_account_id', userId)
-    return { success: false, reason: 'Your deposit account is not set up yet.' }
+    return { success: false, reason: 'Your deposit account is not set up yet.', commissionSwept: false }
   }
 
   if (!user.anchor_counterparty_id) {
     console.error('anchorPayout: user has no anchor_counterparty_id', userId)
-    return { success: false, reason: 'Your payout bank account is not verified yet. Please contact support.' }
+    return { success: false, reason: 'Your payout bank account is not verified yet. Please contact support.', commissionSwept: false }
   }
 
   const reference = `myajo-payout-${userId}-${Date.now()}`
@@ -62,7 +60,17 @@ export async function anchorPayout({ userId, amount, commission = 0 }) {
   // Step 1: sweep the commission, if any. This happens BEFORE the net
   // payout so that if the sweep fails, no money has left the trader's
   // account to an external bank yet — easier to recover from.
-  if (commission > 0) {
+  //
+  // FIXED 2026-08-23: skipCommissionSweep prevents double-charging on a
+  // retry. Confirmed directly — a real attempt swept ₦1,800 commission
+  // successfully, then the NIP transfer failed (insufficient balance).
+  // Without this flag, simply retrying the whole payout would sweep
+  // ANOTHER ₦1,800 before attempting the NIP transfer again, silently
+  // overcharging the trader. withdrawal.js checks payouts.commission_swept
+  // on any prior attempt for this cycle and sets this flag accordingly.
+  let commissionSwept = skipCommissionSweep
+
+  if (commission > 0 && !skipCommissionSweep) {
     try {
       const sweep = await initiateBookTransfer({
         fromAccountId: user.anchor_account_id,
@@ -73,12 +81,19 @@ export async function anchorPayout({ userId, amount, commission = 0 }) {
       })
       if (sweep.status !== 'COMPLETED' && sweep.status !== 'PENDING') {
         console.error('anchorPayout: commission sweep returned unexpected status', userId, sweep)
-        return { success: false, reason: 'Commission could not be processed. Please contact support.' }
+        return { success: false, reason: 'Commission could not be processed. Please contact support.', commissionSwept: false }
       }
+      // Sweep call was accepted by Anchor — mark it swept BEFORE
+      // attempting the NIP transfer below. If the NIP transfer fails
+      // after this point, the caller still needs to know the commission
+      // already genuinely moved, so a retry doesn't sweep it again.
+      commissionSwept = true
     } catch (err) {
       console.error('anchorPayout: commission sweep failed', userId, err)
-      return { success: false, reason: 'Commission could not be processed. Please contact support.' }
+      return { success: false, reason: 'Commission could not be processed. Please contact support.', commissionSwept: false }
     }
+  } else if (commission > 0 && skipCommissionSweep) {
+    console.log('anchorPayout: skipping commission sweep — already swept on a prior attempt for this cycle', userId)
   }
 
   // Step 2: pay the net amount out to the trader's own bank.
@@ -93,7 +108,7 @@ export async function anchorPayout({ userId, amount, commission = 0 }) {
     })
   } catch (err) {
     console.error('anchorPayout: NIP transfer failed to initiate', userId, err)
-    return { success: false, reason: 'Payout transfer could not be started. Please contact support.' }
+    return { success: false, reason: 'Payout transfer could not be started. Please contact support.', commissionSwept }
   }
 
   // NIP transfers commonly come back PENDING from the initiate call —
@@ -115,12 +130,12 @@ export async function anchorPayout({ userId, amount, commission = 0 }) {
 
   if (finalStatus === 'FAILED' || finalStatus === 'REVERSED') {
     console.error('anchorPayout: NIP transfer ended in failure', userId, transfer.transferId, finalStatus)
-    return { success: false, reason: 'Payout transfer failed. Please contact support.' }
+    return { success: false, reason: 'Payout transfer failed. Please contact support.', commissionSwept }
   }
 
   if (finalStatus !== 'COMPLETED') {
     console.error('anchorPayout: NIP transfer still not completed after one check — needs follow-up', userId, transfer.transferId, finalStatus)
   }
 
-  return { success: true, bankReference: transfer.transferId }
+  return { success: true, bankReference: transfer.transferId, commissionSwept }
 }
