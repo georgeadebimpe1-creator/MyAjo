@@ -176,9 +176,18 @@ export async function POST(request) {
       return new NextResponse('OK', { status: 200 })
     }
 
+    // FIXED 2026-08-23: this select previously included 'bank_name',
+    // which does not exist on the cycles table (Postgres error 42703 —
+    // "column cycles.bank_name does not exist"). Because the malformed
+    // select made the whole query error out, this always fell into the
+    // "no active cycle" branch below even when a genuinely active cycle
+    // existed — confirmed directly against the cycles table in Supabase,
+    // which showed status: active the entire time this was failing.
+    // bank_name lives on the users table, not cycles, and nothing in
+    // this file reads cycle.bank_name, so it's just removed here.
     const { data: cycle, error: cycleErr } = await supabaseAdmin
       .from('cycles')
-      .select('id, daily_amount, days_contributed, total_saved, commission, bank_name')
+      .select('id, daily_amount, days_contributed, total_saved, commission')
       .eq('user_id', user.id)
       .eq('status', 'active')
       .single()
