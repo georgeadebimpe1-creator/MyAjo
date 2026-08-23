@@ -77,6 +77,19 @@ export function projectPlan(dailyAmount) {
   return { totalSavings, commission, payout }
 }
 
+// The trader's calendar day number within the cycle — day 1 is
+// start_date itself, day 30 is the last day of the fixed 30-day cycle.
+// This is the single source of truth for "what day of the cycle is it
+// today", used to gate withdrawals, decide when a cycle closes, and
+// detect a genuinely missed day. It is intentionally separate from
+// days_contributed (a count of successful payments) — those two numbers
+// only match when a trader has paid every single day with no misses.
+export function getCycleDayNumber(startDate) {
+  const start = new Date(`${startDate}T00:00:00Z`)
+  const today = new Date(`${new Date().toISOString().split('T')[0]}T00:00:00Z`)
+  return Math.floor((today - start) / (24 * 60 * 60 * 1000)) + 1
+}
+
 export async function getActiveCycle(userId) {
   const { data, error } = await supabaseAdmin
     .from('cycles')
@@ -120,20 +133,30 @@ export async function startCycle(userId, dailyAmount) {
 // WhatsApp text (or any other channel's format) happens where it's
 // displayed, not here.
 export function getBalanceSummary(cycle) {
+  // daysContributed = how many payments have actually landed. Kept as
+  // its own field — still the right number for "how much have you
+  // saved" math below — but no longer what decides when the cycle ends
+  // or when withdrawals unlock. That's cycleDayNumber now: the fixed
+  // 30-calendar-day cycle closes on day 30 regardless of how many
+  // payments were made, so a trader who missed days without using their
+  // catch-up simply ends up with a smaller payout, not a longer cycle.
   const daysContributed = cycle.days_contributed
-  const daysRemaining = 30 - daysContributed
+  const cycleDayNumberRaw = getCycleDayNumber(cycle.start_date)
+  const cycleDayNumber = Math.min(Math.max(cycleDayNumberRaw, 1), 30)
+  const daysRemaining = Math.max(30 - cycleDayNumber, 0)
   const totalSaved = parseFloat(cycle.total_saved)
   const dailyAmount = parseFloat(cycle.daily_amount)
   const commission = parseFloat(cycle.commission)
   const expectedTotal = totalSaved + (daysRemaining * dailyAmount)
   const expectedPayout = expectedTotal - commission
-  const progressPercent = Math.round((daysContributed / 30) * 100)
-  const filled = Math.round((daysContributed / 30) * 10)
+  const progressPercent = Math.round((cycleDayNumber / 30) * 100)
+  const filled = Math.round((cycleDayNumber / 30) * 10)
   const progressBar = '[' + '#'.repeat(filled) + '-'.repeat(10 - filled) + ']'
-  const canWithdraw = daysContributed >= 10
+  const canWithdraw = cycleDayNumber >= 10
   return {
     totalSaved,
     daysContributed,
+    cycleDayNumber,
     daysRemaining,
     expectedTotal,
     commission,
