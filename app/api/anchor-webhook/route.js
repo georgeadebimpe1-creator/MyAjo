@@ -187,7 +187,7 @@ export async function POST(request) {
     // this file reads cycle.bank_name, so it's just removed here.
     const { data: cycle, error: cycleErr } = await supabaseAdmin
       .from('cycles')
-      .select('id, daily_amount, days_contributed, total_saved, commission')
+      .select('id, daily_amount, days_contributed, total_saved, commission, start_date')
       .eq('user_id', user.id)
       .eq('status', 'active')
       .single()
@@ -255,18 +255,30 @@ export async function POST(request) {
       return new NextResponse('OK', { status: 200 })
     }
 
-    // RULE (2026-08-23): missed-day catch-up. A trader who misses a day
-    // may send a second correct-amount payment the next day to cover it
-    // — but only one catch-up, and only for a genuinely missed day, not
-    // as an extra top-up. Enforced as: at most 2 contributions per
-    // calendar day for a cycle, and a 2nd is only allowed if yesterday
-    // has zero contributions recorded (proof a day was actually missed).
-    // Note: on a trader's very first day this can't yet distinguish "day
-    // 1, no prior day exists" from "a day was missed" — a low-risk edge
-    // case flagged here rather than silently handled, since fixing it
-    // properly needs the cycle's fixed start date (see the planned
-    // 30-calendar-day cycle work).
+    // RULE (2026-08-23, calendar-day fix): missed-day catch-up. A trader
+    // who misses a day may send a second correct-amount payment the next
+    // day to cover it — but only one catch-up, and only for a genuinely
+    // missed day, not as an extra top-up. Enforced as: at most 2
+    // contributions per calendar day for a cycle, and a 2nd is only
+    // allowed if yesterday has zero contributions recorded (proof a day
+    // was actually missed).
+    //
+    // FIX: this used to just check "does yesterday have zero
+    // contributions", with no concept of the cycle's own start date. On
+    // a trader's very first day, yesterday trivially has zero
+    // contributions too (the cycle didn't exist yet), so a second
+    // same-day transfer would have been wrongly waved through as a
+    // "missed-day catch-up" when there was no prior day in the cycle to
+    // catch up for. cycleDayNumber (from cycle.start_date) now makes
+    // that distinction explicit: day 1 has no day 0 to miss, so a repeat
+    // payment on day 1 is always an unauthorized top-up, never a
+    // catch-up, regardless of what "yesterday" on the calendar looks
+    // like.
     const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().split('T')[0]
+
+    const cycleStartDate = new Date(`${cycle.start_date}T00:00:00Z`)
+    const todayDate = new Date(`${today}T00:00:00Z`)
+    const cycleDayNumber = Math.floor((todayDate - cycleStartDate) / (24 * 60 * 60 * 1000)) + 1
 
     const { count: todayCount } = await supabaseAdmin
       .from('contributions')
@@ -284,6 +296,18 @@ export async function POST(request) {
     }
 
     if ((todayCount || 0) === 1) {
+      if (cycleDayNumber <= 1) {
+        // Day 1 of the cycle (or a clock/timezone edge case landing
+        // before it) — there is no prior day in this cycle to have
+        // missed, so a second payment today can only be a top-up.
+        console.error('Anchor webhook: unauthorized top-up rejected — cycle day 1, no prior day exists to catch up for', { userId: user.id, cycleId: cycle.id, cycleDayNumber, paymentReference })
+        await sendMessage(
+          user.whatsapp_number,
+          `We received another transfer of N${amountNaira.toLocaleString()}, but today's savings are already recorded and there is no missed day to make up for. This payment has not been recorded yet — please contact support at hello@myajo.com.ng.`
+        )
+        return new NextResponse('OK', { status: 200 })
+      }
+
       const { count: yesterdayCount } = await supabaseAdmin
         .from('contributions')
         .select('id', { count: 'exact', head: true })
@@ -298,8 +322,9 @@ export async function POST(request) {
         )
         return new NextResponse('OK', { status: 200 })
       }
-      // else: yesterday has zero contributions — this is a legitimate
-      // catch-up for a missed day, allow it through.
+      // else: yesterday has zero contributions and this cycle has been
+      // running for more than one day — this is a legitimate catch-up
+      // for a genuinely missed day, allow it through.
     }
 
     const { error: insertErr } = await supabaseAdmin.from('contributions').insert([{
@@ -323,7 +348,11 @@ export async function POST(request) {
     const newDays = cycle.days_contributed + 1
     const newTotal = parseFloat(cycle.total_saved) + amountNaira
     const commission = parseFloat(cycle.commission)
-    const daysRemaining = 30 - newDays
+    // Calendar-bound, not payment-bound: "days remaining" is how many
+    // calendar days are left in the fixed 30-day cycle, capped at 0, not
+    // 30 minus how many payments have landed. A trader who missed a day
+    // is behind on savings, but the cycle still counts down on schedule.
+    const daysRemaining = Math.max(30 - cycleDayNumber, 0)
 
     const { error: cycleUpdateErr } = await supabaseAdmin
       .from('cycles')
@@ -334,8 +363,15 @@ export async function POST(request) {
       console.error('Anchor webhook: contribution recorded but cycle update failed — needs manual reconciliation', { cycleId: cycle.id, newDays, newTotal, error: cycleUpdateErr })
     }
 
-    // Day 30 — cycle complete, trigger payout automatically.
-    if (newDays === 30) {
+    // Day 30 (calendar) — cycle complete, trigger payout automatically.
+    // FIX: this used to check newDays === 30 (the 30th payment), which
+    // meant a trader who missed days without catching up would just
+    // keep the cycle open indefinitely until a 30th payment eventually
+    // landed. Per the fixed-30-calendar-day decision, the cycle now
+    // closes on calendar day 30 regardless of how many payments were
+    // actually made — a trader who fell behind simply gets a smaller
+    // payout, computed from whatever total_saved actually is.
+    if (cycleDayNumber >= 30) {
       const updatedCycle = { ...cycle, days_contributed: newDays, total_saved: newTotal }
       const withdrawableBalance = await getWithdrawableBalance(updatedCycle)
       const result = await processWithdrawal(cycle.id, withdrawableBalance, anchorPayout)
@@ -359,10 +395,12 @@ export async function POST(request) {
       return new NextResponse('OK', { status: 200 })
     }
 
-    // Regular day — send the compact confirmation.
+    // Regular day — send the compact confirmation. dayNumber is the
+    // calendar day (cycleDayNumber), matching what BALANCE and the
+    // day-30 completion trigger now use — not the payment count.
     const message = getMessage('contribution_recorded', 'en', {
       amount: amountNaira.toLocaleString(),
-      dayNumber: newDays,
+      dayNumber: cycleDayNumber,
       totalSaved: newTotal.toLocaleString(),
       daysRemaining,
     })
