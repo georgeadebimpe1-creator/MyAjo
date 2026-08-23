@@ -54,6 +54,37 @@ export async function quoteWithdrawalForCycle(cycle, requestedAmount) {
 }
 
 /**
+ * FIXED 2026-08-23: checks whether a PRIOR payout attempt for this exact
+ * cycle already got far enough to successfully sweep commission at
+ * Anchor, before a later step (the NIP transfer) failed. Confirmed
+ * directly against a real test: commission swept successfully, NIP
+ * transfer then failed on insufficient balance — a naive retry would
+ * have swept commission a second time, silently overcharging the
+ * trader. Requires a `commission_swept` boolean column on `payouts`
+ * (default false), set true by processWithdrawal below whenever
+ * anchorPayout reports it swept commission, success or failure.
+ */
+async function wasCommissionAlreadySwept(cycleId) {
+  const { data: priorAttempts, error } = await supabaseAdmin
+    .from('payouts')
+    .select('id, commission_swept')
+    .eq('cycle_id', cycleId)
+    .eq('commission_swept', true)
+    .limit(1)
+
+  if (error) {
+    // Can't confirm either way — fail safe by NOT skipping the sweep is
+    // actually the wrong default here (that risks a double charge), so
+    // instead log loudly and treat as swept-unknown, forcing a human to
+    // check payouts for this cycle before any further automatic retry.
+    console.error('wasCommissionAlreadySwept: could not check prior payouts — refusing to guess', cycleId, error)
+    throw new Error('Could not verify prior payout history for this cycle. Please check manually before retrying.')
+  }
+
+  return (priorAttempts || []).length > 0
+}
+
+/**
  * Step 2: actually process a withdrawal — logs it in payouts, calls the
  * payout function, updates the cycle. Re-validates against live data,
  * since balance may have changed since the quote was first shown.
@@ -85,6 +116,14 @@ export async function processWithdrawal(cycleId, requestedAmount, payoutFn) {
 
   const commission = freshQuote.payoutType === 'cycle_completion' ? parseFloat(cycle.commission) : 0
 
+  // See wasCommissionAlreadySwept above — this is what actually prevents
+  // a retry (this call) from sweeping commission a second time after an
+  // earlier attempt got the sweep through but failed on the NIP leg.
+  let skipCommissionSweep = false
+  if (commission > 0) {
+    skipCommissionSweep = await wasCommissionAlreadySwept(cycle.id)
+  }
+
   const { data: payout, error: insertErr } = await supabaseAdmin
     .from('payouts')
     .insert([{
@@ -106,12 +145,19 @@ export async function processWithdrawal(cycleId, requestedAmount, payoutFn) {
     return { success: false, reason: 'Could not log this withdrawal. Please try again.' }
   }
 
-  const payoutResult = await payoutFn({ userId: cycle.user_id, amount: freshQuote.netAmount, commission })
+  const payoutResult = await payoutFn({ userId: cycle.user_id, amount: freshQuote.netAmount, commission, skipCommissionSweep })
 
   if (!payoutResult.success) {
     const { error: failUpdateErr } = await supabaseAdmin
       .from('payouts')
-      .update({ status: 'failed', failed_reason: payoutResult.reason || 'Unknown error' })
+      .update({
+        status: 'failed',
+        failed_reason: payoutResult.reason || 'Unknown error',
+        // Record whether commission genuinely moved on THIS attempt, even
+        // though the overall attempt failed — this is exactly what the
+        // NEXT retry's wasCommissionAlreadySwept check needs to see.
+        commission_swept: !!payoutResult.commissionSwept,
+      })
       .eq('id', payout.id)
 
     if (failUpdateErr) {
@@ -163,6 +209,7 @@ export async function processWithdrawal(cycleId, requestedAmount, payoutFn) {
       status: 'completed',
       completed_at: new Date().toISOString(),
       bank_reference: payoutResult.bankReference || null,
+      commission_swept: !!payoutResult.commissionSwept,
     })
     .eq('id', payout.id)
 
