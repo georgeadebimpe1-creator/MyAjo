@@ -6,7 +6,7 @@ import { quoteWithdrawalForCycle, processWithdrawal } from '../../lib/withdrawal
 import { anchorPayout } from '../../lib/payout'
 import { getSession, updateSession, clearSession } from '../../lib/session'
 import { getUserByWhatsapp, createOrUpdateAccount, freezeAccount, provisionAnchorAccount, checkAndFinalizeIfApproved, verifyAndLinkBankAccount, verifyAndLinkResolvedBank } from '../../lib/accounts'
-import { getActiveCycle, startCycle, getBalanceSummary, getTodaysContribution, projectPlan, validateDailyAmount, calculateCommission } from '../../lib/savings'
+import { getActiveCycle, startCycle, getBalanceSummary, getTodaysContribution, projectPlan, validateDailyAmount, calculateCommission, getCycleDayNumber } from '../../lib/savings'
 
 const META_VERIFY_TOKEN = process.env.META_VERIFY_TOKEN
 const APP_URL = process.env.APP_URL || 'https://my-ajo-ten.vercel.app'
@@ -101,6 +101,21 @@ async function beginNewSavingsPlan(whatsapp) {
       await clearSession(whatsapp)
       return `You already have an active savings cycle running.\n\nType BALANCE to check your savings, PAID to confirm today's transfer, or WITHDRAW followed by an amount to withdraw.`
     }
+
+    // Returning trader who already completed (or withdrew from) a prior
+    // cycle — they're already KYC-verified and already have a deposit
+    // account with our banking partner from last time. FIX: this used
+    // to fall straight through to the full from-scratch onboarding
+    // questionnaire below (name, email, address, bank, re-verification)
+    // for every returning trader, with no way to skip it — even though
+    // none of that has changed and provisionAnchorAccount() already
+    // knew how to short-circuit for exactly this case. Now a verified
+    // returning trader is just asked how much they want to save this
+    // time, and their new cycle starts against their existing account.
+    if (existingUser.kyc_status === 'verified' && existingUser.anchor_account_id && existingUser.anchor_account_number) {
+      await updateSession(whatsapp, 'new_cycle_amount', {})
+      return `Welcome back ${existingUser.full_name}!\n\nReady to start a new 30-day savings cycle. How much would you like to save daily this time? (N1,000 - N10,000)`
+    }
   }
 
   await updateSession(whatsapp, 'onboarding', {})
@@ -136,23 +151,28 @@ async function handleMessage(from, body) {
       const user = await getUserByWhatsapp(whatsapp)
 
       if (!user) {
-        await clearSession(whatsapp)
+        // FIX (2026-08-24): this used to clearSession() before telling
+        // the trader to "type 1" — clearing the session means step
+        // becomes 'welcome' next message, not 'main_menu', so the "1"
+        // this message just asked for falls through to "I did not
+        // understand" instead of being recognized. Reproduced live.
+        await updateSession(whatsapp, 'main_menu', {})
         return `I could not find your account. Please type 1 to start your savings plan first.`
       }
 
       const cycle = await getActiveCycle(user.id)
       if (!cycle) {
-        await clearSession(whatsapp)
+        await updateSession(whatsapp, 'main_menu', {})
         return `You do not have an active savings cycle yet.\n\nType 1 to start your savings plan.`
       }
 
       const s = getBalanceSummary(cycle)
       await clearSession(whatsapp)
-      return `Your Savings\n\nHello ${user.full_name}\n\nSaved: N${s.totalSaved.toLocaleString()}\nToday's status: ${s.daysContributed > 0 ? 'Active' : 'Not started'}\nDays completed: ${s.daysContributed} of 30\nDays remaining: ${s.daysRemaining}\n\nExpected total: N${s.expectedTotal.toLocaleString()}\nMyAjo commission: N${s.commission.toLocaleString()}\nYour payout: N${s.expectedPayout.toLocaleString()}\n\nType MENU to return to the main menu.`
+      return `Your Savings\n\nHello ${user.full_name}\n\nSaved: N${s.totalSaved.toLocaleString()}\nToday's status: ${s.daysContributed > 0 ? 'Active' : 'Not started'}\nDay ${s.cycleDayNumber} of 30 (${s.daysContributed} payment${s.daysContributed === 1 ? '' : 's'} made)\nDays remaining: ${s.daysRemaining}\n\nExpected total: N${s.expectedTotal.toLocaleString()}\nMyAjo commission: N${s.commission.toLocaleString()}\nYour payout: N${s.expectedPayout.toLocaleString()}\n\nType MENU to return to the main menu.`
     }
 
     if (message === '3') {
-      await clearSession(whatsapp)
+      await updateSession(whatsapp, 'main_menu', {})
       const exampleCommission = calculateCommission(1000)
       const examplePayout = 30000 - exampleCommission
       return `How MyAjo Works\n\nMyAjo is a digital daily savings platform built on the trusted ajo tradition.\n\n1. You choose how much to save every day\n2. You save daily for 30 days\n3. At the end of 30 days you collect your full savings minus MyAjo's commission\n\nExample:\nSave N1,000 every day\nTotal after 30 days: N30,000\nMyAjo commission: N${exampleCommission.toLocaleString()}\nYou receive: N${examplePayout.toLocaleString()}\n\nNeed your money before 30 days? You can withdraw anytime after day 10 — a small fee from our banking partner applies (N50 for withdrawals up to N10,000, N100 above that). MyAjo never charges you extra for this.\n\nYour money is safe and held by our licensed banking partner.\n\nType 1 to start saving today.`
@@ -164,6 +184,25 @@ async function handleMessage(from, body) {
     }
 
     return `Please reply with a number between 1 and 4 to choose an option.\n\n1. Start Daily Savings\n2. Check My Balance\n3. Learn How It Works\n4. Speak with Support`
+  }
+
+  if (step === 'new_cycle_amount') {
+    const dailyAmount = parseFloat(message.replace(/,/g, ''))
+    const { valid, reason } = validateDailyAmount(dailyAmount)
+    if (!valid) {
+      return `${reason}\n\nHow much would you like to save daily? (N1,000 - N10,000)`
+    }
+
+    const user = await getUserByWhatsapp(whatsapp)
+    if (!user || !user.anchor_account_number) {
+      console.error('new_cycle_amount: returning user missing account details at cycle start', whatsapp)
+      await clearSession(whatsapp)
+      return `Something went wrong finding your account details. Please type MENU to start over, or contact support at hello@myajo.com.ng.`
+    }
+
+    await startCycle(user.id, dailyAmount)
+    await clearSession(whatsapp)
+    return `Your savings plan is now active!\n\n${user.full_name} your new MyAjo journey has begun.\n\nSend your daily savings of N${dailyAmount.toLocaleString()} to your existing account:\n\nAccount Number: ${user.anchor_account_number}\n(This is your dedicated MyAjo savings account, held with our licensed banking partner.)\n\nWhen your transfer goes through, we will confirm it automatically. You can also type PAID anytime to check.\n\nGood luck and stay consistent!`
   }
 
   if (step === 'onboarding') {
@@ -333,15 +372,24 @@ async function handleMessage(from, body) {
 
     const cycle = await getActiveCycle(user.id)
     if (!cycle) {
+      // FIX (2026-08-24): same class of bug as the two above — this
+      // told the trader to type 1 without ever putting the session
+      // into 'main_menu', so "1" fell through to "I did not
+      // understand". Reproduced live: PAID -> "type 1" -> "1" ->
+      // fallback -> had to type MENU, then 1, to actually get through.
+      await updateSession(whatsapp, 'main_menu', {})
       return `You do not have an active savings cycle. Type 1 to start one.`
     }
 
     const paidToday = await getTodaysContribution(cycle.id)
     if (paidToday) {
-      const daysRemaining = 30 - cycle.days_contributed
+      // Calendar day, not payment count — matches the webhook's
+      // confirmation message and the fixed 30-calendar-day cycle rule.
+      const cycleDayNumber = Math.min(getCycleDayNumber(cycle.start_date), 30)
+      const daysRemaining = Math.max(30 - cycleDayNumber, 0)
       return getMessage('contribution_recorded', 'en', {
         amount: parseFloat(cycle.daily_amount).toLocaleString(),
-        dayNumber: cycle.days_contributed,
+        dayNumber: cycleDayNumber,
         totalSaved: parseFloat(cycle.total_saved).toLocaleString(),
         daysRemaining,
       })
@@ -362,15 +410,17 @@ async function handleMessage(from, body) {
 
     const cycle = await getActiveCycle(user.id)
     if (!cycle) {
+      await updateSession(whatsapp, 'main_menu', {})
       return `You do not have an active savings cycle.\n\nType 1 to start saving today.`
     }
 
     const s = getBalanceSummary(cycle)
+    const daysToUnlock = 10 - s.cycleDayNumber
     const withdrawLine = s.canWithdraw
       ? `\n\nYou can withdraw anytime. Type WITHDRAW followed by an amount.`
-      : `\n\nWithdrawals unlock on day 10 (${10 - s.daysContributed} day${10 - s.daysContributed === 1 ? '' : 's'} to go).`
+      : `\n\nWithdrawals unlock on day 10 (${daysToUnlock} day${daysToUnlock === 1 ? '' : 's'} to go).`
 
-    return `Your Savings\n\nHello ${user.full_name}\n\nSaved: N${s.totalSaved.toLocaleString()}\nDays completed: ${s.daysContributed} of 30\n\nProgress: ${s.progressBar} ${s.progressPercent}%\n\nExpected total: N${s.expectedTotal.toLocaleString()}\nMyAjo commission: N${s.commission.toLocaleString()}\nYour payout: N${s.expectedPayout.toLocaleString()}${withdrawLine}\n\nKeep saving every day!`
+    return `Your Savings\n\nHello ${user.full_name}\n\nSaved: N${s.totalSaved.toLocaleString()}\nDay ${s.cycleDayNumber} of 30 (${s.daysContributed} payment${s.daysContributed === 1 ? '' : 's'} made)\n\nProgress: ${s.progressBar} ${s.progressPercent}%\n\nExpected total: N${s.expectedTotal.toLocaleString()}\nMyAjo commission: N${s.commission.toLocaleString()}\nYour payout: N${s.expectedPayout.toLocaleString()}${withdrawLine}\n\nKeep saving every day!`
   }
 
   if (upper.startsWith('WITHDRAW')) {
@@ -384,9 +434,10 @@ async function handleMessage(from, body) {
 
     const cycle = await getActiveCycle(user.id)
     if (!cycle) {
+      await updateSession(whatsapp, 'main_menu', {})
       return `You do not have an active savings cycle. Type 1 to start one.`
     }
- 
+
     if (isNaN(amount)) {
       return `To withdraw, send WITHDRAW followed by the amount.\n\nExample: WITHDRAW 5000`
     }
