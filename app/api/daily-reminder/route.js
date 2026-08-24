@@ -2,6 +2,9 @@ import { NextResponse } from 'next/server'
 import { supabase } from '../../lib/supabase'
 import { sendMessage } from '../../lib/whatsapp'
 import { getMessage } from '../../lib/messages'
+import { getCycleDayNumber } from '../../lib/savings'
+import { getWithdrawableBalance, processWithdrawal } from '../../lib/withdrawal'
+import { anchorPayout } from '../../lib/payout'
 
 // Vercel Cron calls this once a day with an Authorization header
 // matching CRON_SECRET. Anyone else calling this URL without that
@@ -16,7 +19,7 @@ export async function GET(request) {
 
   const { data: cycles, error } = await supabase
     .from('cycles')
-    .select('id, daily_amount, days_contributed, user_id, users(whatsapp_number)')
+    .select('id, daily_amount, days_contributed, total_saved, commission, start_date, user_id, users(full_name, whatsapp_number)')
     .eq('status', 'active')
 
   if (error) {
@@ -26,8 +29,41 @@ export async function GET(request) {
 
   let sent = 0
   let skipped = 0
+  let closed = 0
 
   for (const cycle of cycles || []) {
+    // FIXED 30-CALENDAR-DAY CYCLE: the webhook closes a cycle the moment
+    // a payment lands on calendar day 30, but if a trader simply stops
+    // paying before day 30, no webhook ever fires to close it. This is
+    // the sweep for that case — anything still 'active' once its own
+    // calendar day 30 has arrived gets closed here, with whatever total
+    // was actually saved. Runs once a day, same schedule as reminders,
+    // so a cycle closes on the day it's due at the latest.
+    const cycleDayNumber = getCycleDayNumber(cycle.start_date)
+
+    if (cycleDayNumber >= 30) {
+      if (!cycle.users?.whatsapp_number) {
+        console.error('Daily reminder: overdue cycle missing whatsapp number, cannot notify', cycle.id)
+      }
+
+      const withdrawableBalance = await getWithdrawableBalance(cycle)
+      const result = await processWithdrawal(cycle.id, withdrawableBalance, anchorPayout)
+
+      if (result.success && cycle.users?.whatsapp_number) {
+        const message = getMessage('cycle_complete', 'en', {
+          totalSaved: parseFloat(cycle.total_saved).toLocaleString(),
+          commission: parseFloat(cycle.commission).toLocaleString(),
+          netPayout: result.netAmount.toLocaleString(),
+        })
+        await sendMessage(cycle.users.whatsapp_number, message)
+      } else if (!result.success) {
+        console.error('Daily reminder: day-30 auto-close failed, needs manual reconciliation', { cycleId: cycle.id, reason: result.reason })
+      }
+
+      closed++
+      continue
+    }
+
     const { data: paidToday } = await supabase
       .from('contributions')
       .select('id')
@@ -54,5 +90,5 @@ export async function GET(request) {
     sent++
   }
 
-  return NextResponse.json({ ok: true, sent, skipped })
+  return NextResponse.json({ ok: true, sent, skipped, closed })
 }
