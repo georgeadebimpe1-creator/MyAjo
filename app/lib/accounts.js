@@ -22,7 +22,7 @@ import { resolveBankFromName } from './bankMatch'
 export async function getUserByWhatsapp(whatsapp) {
   const { data, error } = await supabaseAdmin
     .from('users')
-    .select('id, full_name, email, kyc_status, bank_name, bank_account_number, status')
+    .select('id, full_name, email, kyc_status, bank_name, bank_account_number, status, anchor_account_id, anchor_account_number')
     .eq('whatsapp_number', whatsapp)
     .single()
 
