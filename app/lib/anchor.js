@@ -57,7 +57,17 @@ async function createAnchorCustomer({ fullName, email, phone, dob, gender, addre
   const result = await response.json()
   if (!response.ok) {
     console.error('Anchor customer creation failed:', response.status, JSON.stringify(result), 'Request sent:', JSON.stringify(requestBody))
-    throw new Error('Anchor customer creation failed')
+    // The plain message stays the same for anything already relying on
+    // it, but the real Anchor detail is attached so a caller can tell a
+    // "BVN already exists" 400 apart from any other failure — that one
+    // specific case means this is a returning trader (changed WhatsApp
+    // number, or re-onboarding after a local record was deleted), not a
+    // genuine error, and should be handled by looking the customer up
+    // rather than surfacing a failure to the trader.
+    const err = new Error('Anchor customer creation failed')
+    err.anchorDetail = result?.errors?.[0]?.detail || null
+    err.status = response.status
+    throw err
   }
   console.log('Anchor customer created:', JSON.stringify(result), 'Request sent:', JSON.stringify(requestBody))
   return result.data.id // Anchor's customer ID
@@ -338,4 +348,4 @@ export {
   initiateBookTransfer,
   initiateNipTransfer,
   verifyTransfer,
-        }
+              }
