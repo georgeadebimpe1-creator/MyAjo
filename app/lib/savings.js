@@ -182,4 +182,4 @@ export async function getTodaysContribution(cycleId) {
     console.error('getTodaysContribution: Supabase error', cycleId, error)
   }
   return data
-}
+    }
