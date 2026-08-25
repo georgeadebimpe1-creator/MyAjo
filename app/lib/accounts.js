@@ -16,6 +16,7 @@
 import { supabaseAdmin } from './supabase'
 import { createAnchorCustomer, createAnchorDepositAccount, verifyAnchorCustomerKyc, getAnchorCustomer, verifyAccountNumber, createCounterParty } from './anchor'
 import { resolveBankFromName } from './bankMatch'
+import { sendAdminAlert } from './alerts'
 
 // Fetches the full set of fields any step in the app might need, so
 // every caller uses one consistent shape instead of hand-picking columns.
@@ -261,19 +262,47 @@ export async function provisionAnchorAccount(userId, address) {
   let anchorCustomerId = user.anchor_customer_id
 
   if (!anchorCustomerId) {
-    anchorCustomerId = await createAnchorCustomer({
-      fullName: user.full_name,
-      email: user.email,
-      phone,
-      dob: user.date_of_birth,
-      gender: user.gender,
-      // Structured address, passed in directly from onboarding — this
-      // is the shape Anchor's customer-creation API needs
-      // (addressLine_1/city/state/postalCode/country), not a single
-      // display string.
-      address,
-      bvn: user.bvn,
-    })
+    try {
+      anchorCustomerId = await createAnchorCustomer({
+        fullName: user.full_name,
+        email: user.email,
+        phone,
+        dob: user.date_of_birth,
+        gender: user.gender,
+        // Structured address, passed in directly from onboarding — this
+        // is the shape Anchor's customer-creation API needs
+        // (addressLine_1/city/state/postalCode/country), not a single
+        // display string.
+        address,
+        bvn: user.bvn,
+      })
+    } catch (err) {
+      // This BVN already belongs to a customer on Anchor's side. In
+      // production this should be rare now that the Dojah webhook
+      // matches returning traders by BVN before ever getting here — it
+      // mainly showed up during testing (a Supabase row deleted and
+      // re-onboarded without Anchor's own record being touched).
+      //
+      // NOT auto-resolved: as of 2026-08-24, checked Anchor's docs for
+      // a way to look up an existing customer BY BVN and found no such
+      // endpoint — only lookup-by-customer-ID (getAnchorCustomer),
+      // which is useless here since we don't have their ID. Silently
+      // guessing at one would be worse than failing loudly, so this
+      // fails safely instead: the trader gets a clear message, and an
+      // admin alert carries everything needed to resolve it by hand
+      // (find the customer in Anchor's dashboard, paste the ID into
+      // this user's anchor_customer_id column in Supabase).
+      if (err.status === 400 && err.anchorDetail?.toLowerCase().includes('bvn')) {
+        console.error('provisionAnchorAccount: BVN already exists at Anchor — needs manual customer ID lookup', {
+          userId, whatsapp: user.whatsapp_number, anchorDetail: err.anchorDetail,
+        })
+        await sendAdminAlert(
+          `BVN conflict provisioning an Anchor account.\n\nUser ID: ${userId}\nWhatsApp: ${user.whatsapp_number}\nAnchor said: "${err.anchorDetail}"\n\nThis trader's BVN already has a customer on Anchor. Find their existing customer ID in the Anchor dashboard and set it as anchor_customer_id for this user in Supabase, then they can retry.`
+        )
+        throw new Error('we found an existing verification on file for you — our team has been notified and will sort this out shortly. Please contact support at hello@myajo.com.ng if you don\'t hear back soon')
+      }
+      throw err
+    }
 
     const { error: custErr } = await supabaseAdmin
       .from('users')
@@ -407,4 +436,4 @@ export async function checkAndFinalizeIfApproved(userId) {
   // account creation right now instead of waiting further.
   const account = await finalizeAnchorDepositAccount(userId)
   return { status: 'ready', accountNumber: account.accountNumber }
-}
+      }
