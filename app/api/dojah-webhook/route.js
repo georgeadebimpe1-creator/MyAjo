@@ -1,5 +1,8 @@
 import { NextResponse } from 'next/server'
 import { supabaseAdmin } from '../../lib/supabase'
+import { sendMessage } from '../../lib/whatsapp'
+import { updateSession, clearSession } from '../../lib/session'
+import { getActiveCycle, getBalanceSummary } from '../../lib/savings'
 // Dojah calls this automatically once verification is complete.
 // This is the trustworthy source of truth — not the widget's onSuccess
 // in the browser, which only tells the TRADER it succeeded, not us.
@@ -57,29 +60,97 @@ export async function POST(request) {
       // inside `entity`, this needs a one-line adjustment.
       const bvn = entity.bvn || null
 
+      // A trader who changed their WhatsApp number (lost phone, SIM
+      // swap, new line) shows up here looking exactly like a brand-new
+      // signup — a whatsapp_number Temi has never seen before. Without
+      // this check, the upsert below (keyed on whatsapp_number) would
+      // create a SECOND users row for the same real person, completely
+      // disconnected from their original row — which is what still
+      // holds their actual cycle, contribution history, and Anchor
+      // account. Their real savings would still exist, just invisible
+      // to them under the new number. This checks BVN first: if it
+      // already belongs to a different row, that's the same trader,
+      // and the fix is to update THAT row's whatsapp_number, not to
+      // create a new identity.
+      let targetUserId = null
+      if (bvn) {
+        const { data: existingByBvn, error: bvnLookupErr } = await supabaseAdmin
+          .from('users')
+          .select('id, whatsapp_number')
+          .eq('bvn', bvn)
+          .neq('whatsapp_number', whatsapp)
+          .maybeSingle()
+
+        if (bvnLookupErr) {
+          console.error('Dojah webhook: BVN lookup failed, falling back to whatsapp_number upsert — a duplicate row is possible, check manually', whatsapp, bvnLookupErr)
+        } else if (existingByBvn) {
+          targetUserId = existingByBvn.id
+          console.log('Dojah webhook: BVN matched an existing trader under a different WhatsApp number — migrating their identity to the new number instead of creating a new row', {
+            oldWhatsapp: existingByBvn.whatsapp_number,
+            newWhatsapp: whatsapp,
+            userId: targetUserId,
+          })
+        }
+      }
+
+      const verifiedFields = {
+        whatsapp_number: whatsapp,
+        phone_number: whatsapp,
+        kyc_status: 'verified',
+        full_name: fullName,
+        date_of_birth: entity.date_of_birth || null,
+        gender: entity.gender || null,
+        residential_address: entity.residential_address || null,
+        bvn: bvn,
+      }
+
       // FIX 3: check the Supabase response for an error instead of
       // discarding it. Supabase does NOT throw on RLS-blocked writes —
       // it returns { error }, which the old code never inspected, so a
       // blocked write silently looked identical to a successful one.
-      const { error } = await supabaseAdmin
-        .from('users')
-        .upsert(
-          {
-            whatsapp_number: whatsapp,
-            phone_number: whatsapp,
-            kyc_status: 'verified',
-            full_name: fullName,
-            date_of_birth: entity.date_of_birth || null,
-            gender: entity.gender || null,
-            residential_address: entity.residential_address || null,
-            bvn: bvn,
-          },
-          { onConflict: 'whatsapp_number' }
-        )
+      const { error } = targetUserId
+        ? await supabaseAdmin.from('users').update(verifiedFields).eq('id', targetUserId)
+        : await supabaseAdmin.from('users').upsert(verifiedFields, { onConflict: 'whatsapp_number' })
 
       if (error) {
         console.error('Dojah webhook: Supabase upsert failed (verified)', whatsapp, error)
         return new NextResponse('Error', { status: 500 })
+      }
+
+      // RECONNECT: this verification matched an existing trader under a
+      // different WhatsApp number — their identity, cycle history, and
+      // Anchor account are now linked to THIS number. Message them
+      // directly rather than waiting for them to type something first
+      // (they may still be sitting on the "reply with your details"
+      // onboarding text from before this webhook resolved — this
+      // supersedes that; no other details need re-entering). Whether
+      // they land on BALANCE or a fresh daily-amount prompt depends on
+      // whether they have a cycle running right now.
+      if (targetUserId) {
+        try {
+          const activeCycle = await getActiveCycle(targetUserId)
+          if (activeCycle) {
+            const s = getBalanceSummary(activeCycle)
+            await clearSession(whatsapp)
+            await sendMessage(
+              whatsapp,
+              `Welcome back${fullName ? `, ${fullName}` : ''}! We've reconnected your MyAjo account to this number.\n\nYou have an active savings cycle running — Day ${s.cycleDayNumber} of 30, N${s.totalSaved.toLocaleString()} saved so far.\n\nType BALANCE anytime to check your progress, PAID to confirm today's transfer, or WITHDRAW followed by an amount.`
+            )
+          } else {
+            await updateSession(whatsapp, 'new_cycle_amount', {})
+            await sendMessage(
+              whatsapp,
+              `Welcome back${fullName ? `, ${fullName}` : ''}! We've reconnected your MyAjo account to this number.\n\nReady to start a new 30-day savings cycle. How much would you like to save daily this time? (N1,000 - N10,000)`
+            )
+          }
+        } catch (reconnectMsgErr) {
+          // The identity migration itself already succeeded and was
+          // written to the database above — this only affects whether
+          // the trader got proactively messaged about it. Not fatal:
+          // worth logging, but don't fail the whole webhook over a
+          // notification failure when the actual data write succeeded.
+          console.error('Dojah webhook: reconnect succeeded but the welcome-back message failed', whatsapp, targetUserId, reconnectMsgErr)
+        }
       }
 
       if (!bvn) {
