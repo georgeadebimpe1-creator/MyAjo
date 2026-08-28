@@ -18,6 +18,33 @@ import { createAnchorCustomer, createAnchorDepositAccount, verifyAnchorCustomerK
 import { resolveBankFromName } from './bankMatch'
 import { sendAdminAlert } from './alerts'
 
+// Persists a language choice permanently on an existing trader's own
+// record. Without this, picking a language at the select_language step
+// only ever lived in session.temp_data — which gets wiped by
+// clearSession() at the end of nearly every completed action (BALANCE,
+// PAID, etc). The moment that happened, any code path that reads
+// user.language as its source of truth (top-level BALANCE/PAID typed as
+// commands, not the numbered menu) fell straight back to the database
+// default ('en'), silently reverting the trader to English mid-
+// conversation. Confirmed live 2026-08-28: Yoruba worked once inside
+// one session, then reverted on the very next command. This only
+// covers a RETURNING trader (one who already has a row) — a brand-new
+// signup's language is written once, correctly, by
+// createOrUpdateAccount() at account creation.
+export async function updateUserLanguage(whatsapp, language) {
+  const { error } = await supabaseAdmin
+    .from('users')
+    .update({ language })
+    .eq('whatsapp_number', whatsapp)
+
+  if (error) {
+    // Not fatal — the trader's session still has the right language for
+    // the rest of THIS conversation, they just won't stay on it once
+    // the session clears. Worth knowing about, not worth blocking on.
+    console.error('updateUserLanguage: failed to persist language choice', whatsapp, language, error)
+  }
+}
+
 // Fetches the full set of fields any step in the app might need, so
 // every caller uses one consistent shape instead of hand-picking columns.
 export async function getUserByWhatsapp(whatsapp) {
