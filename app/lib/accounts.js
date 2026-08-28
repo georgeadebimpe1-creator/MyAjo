@@ -51,6 +51,7 @@ export async function createOrUpdateAccount(whatsapp, details) {
         bank_name: details.bank_name,
         bank_account_number: details.bank_account_number,
         residential_address: details.residential_address,
+        language: details.language || existingUser.language || 'en',
       })
       .eq('id', existingUser.id)
 
@@ -74,6 +75,7 @@ export async function createOrUpdateAccount(whatsapp, details) {
       bank_account_name: details.full_name,
       residential_address: details.residential_address,
       status: 'active',
+      language: details.language || 'en',
     }])
     .select()
     .single()
