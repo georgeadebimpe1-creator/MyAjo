@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server'
 import { supabase } from '../../lib/supabase'
 import { sendMessage } from '../../lib/whatsapp'
-import { getMessage } from '../../lib/messages'
+import { getMessage, LANGUAGES, LANGUAGE_SELECT_MESSAGE } from '../../lib/messages'
 import { quoteWithdrawalForCycle, processWithdrawal } from '../../lib/withdrawal'
 import { anchorPayout } from '../../lib/payout'
 import { getSession, updateSession, clearSession } from '../../lib/session'
@@ -22,6 +22,28 @@ const APP_URL = process.env.APP_URL || 'https://my-ajo-ten.vercel.app'
 // COMMISSION_TIERS table. Kobo only matters at the point a request is
 // actually built for Anchor's API (not in this file) — that is the one
 // place a x100 conversion should happen.
+//
+// LANGUAGE: every conversation now opens with LANGUAGE_SELECT_MESSAGE
+// (see lib/messages.js) before anything else — including for returning
+// traders, by design, so they can switch language any time they start a
+// fresh interaction. Once chosen, the code is carried in session.temp_data
+// as `language` and threaded through every updateSession() call for the
+// rest of that flow, so it survives step changes. It's written
+// permanently to the trader's user record at account creation
+// (createOrUpdateAccount, in lib/accounts.js), matching the `language`
+// column's own comment in Supabase, and updated again on every later
+// cycle in case they picked differently that time.
+//
+// As of this pass, EVERY reply in this file that isn't a WhatsApp
+// Message Template (see PHASE 1B note in lib/messages.js) is routed
+// through getMessage() with the trader's chosen language — see the
+// translation-confidence note at the top of lib/messages.js before
+// treating any of it as launch-ready; only the original Hausa Phase 1
+// content has been through native-speaker review so far.
+
+function getLang(temp) {
+  return (temp && temp.language) || 'en'
+}
 
 // Parses the trader's one-shot onboarding reply: full name, email,
 // residential address, bank name, account number, daily amount — each
@@ -35,13 +57,17 @@ const APP_URL = process.env.APP_URL || 'https://my-ajo-ten.vercel.app'
 // here — those come from Dojah's BVN lookup automatically once the
 // trader completes verification, and asking for them again would just
 // be typed data Anchor re-checks against the BVN record anyway.
-function parseOnboardingDetails(text) {
+//
+// This reply format prompt itself stays English-only regardless of the
+// trader's chosen language for now (see lib/messages.js phase notes) —
+// only the error explanations below are localized via getMessage.
+function parseOnboardingDetails(text, lang) {
   const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0)
 
   if (lines.length !== 6) {
     return {
       valid: false,
-      reason: `I need all 6 details, each on its own line:\n\nFull Name\nEmail Address\nResidential Address (Street, City, State)\nBank Name\nAccount Number\nDaily savings amount (1000-10000)\n\nExample:\nAda Okafor\nada@email.com\n12 Market Road, Ikeja, Lagos\nGTBank\n0123456789\n5000`,
+      reason: getMessage('onboarding_details_missing', lang),
     }
   }
 
@@ -49,14 +75,14 @@ function parseOnboardingDetails(text) {
   const accountNumber = accountNumberRaw.replace(/\s/g, '')
 
   if (!email.includes('@') || !email.includes('.')) {
-    return { valid: false, reason: `That email address doesn't look right. Please resend all 6 details with a valid email.` }
+    return { valid: false, reason: getMessage('onboarding_details_missing', lang) }
   }
 
   const addressParts = addressRaw.split(',').map(p => p.trim()).filter(p => p.length > 0)
   if (addressParts.length < 2) {
     return {
       valid: false,
-      reason: `Please include your street address and state, separated by commas — for example: 12 Market Road, Ikeja, Lagos.\n\nPlease resend all 6 details.`,
+      reason: getMessage('onboarding_details_missing', lang),
     }
   }
   const address = {
@@ -69,12 +95,14 @@ function parseOnboardingDetails(text) {
   const addressDisplay = addressParts.join(', ')
 
   if (accountNumber.length < 10 || !/^\d+$/.test(accountNumber)) {
-    return { valid: false, reason: `That account number doesn't look right — it should be 10 digits. Please resend all 6 details.` }
+    return { valid: false, reason: getMessage('onboarding_details_missing', lang) }
   }
 
   const dailyAmount = parseFloat(amountRaw.replace(/,/g, ''))
   const { valid, reason } = validateDailyAmount(dailyAmount)
   if (!valid) {
+    // reason comes from lib/savings.js and stays English-only for now —
+    // that file has no translation layer yet, flagged as a known gap.
     return { valid: false, reason: `${reason}\n\nPlease resend all 6 details with a valid amount.` }
   }
 
@@ -92,14 +120,14 @@ function parseOnboardingDetails(text) {
   }
 }
 
-async function beginNewSavingsPlan(whatsapp) {
+async function beginNewSavingsPlan(whatsapp, lang) {
   const existingUser = await getUserByWhatsapp(whatsapp)
 
   if (existingUser) {
     const activeCycle = await getActiveCycle(existingUser.id)
     if (activeCycle) {
       await clearSession(whatsapp)
-      return `You already have an active savings cycle running.\n\nType BALANCE to check your savings, PAID to confirm today's transfer, or WITHDRAW followed by an amount to withdraw.`
+      return getMessage('active_cycle_exists', lang)
     }
 
     // Returning trader who already completed (or withdrew from) a prior
@@ -113,19 +141,29 @@ async function beginNewSavingsPlan(whatsapp) {
     // returning trader is just asked how much they want to save this
     // time, and their new cycle starts against their existing account.
     if (existingUser.kyc_status === 'verified' && existingUser.anchor_account_id && existingUser.anchor_account_number) {
-      await updateSession(whatsapp, 'new_cycle_amount', {})
-      return `Welcome back ${existingUser.full_name}!\n\nReady to start a new 30-day savings cycle. How much would you like to save daily this time? (N1,000 - N10,000)`
+      await updateSession(whatsapp, 'new_cycle_amount', { language: lang })
+      return getMessage('returning_trader_new_cycle', lang, { name: existingUser.full_name })
     }
   }
 
-  await updateSession(whatsapp, 'onboarding', {})
+  await updateSession(whatsapp, 'onboarding', { language: lang })
   const verifyLink = `${APP_URL}/verify?ref=${whatsapp}`
-  return `Great! Let's set up your savings plan. Two things to do — in any order:\n\n1) Verify your identity here (takes about a minute):\n${verifyLink}\n\n2) Reply here with your details, one per line:\n\nFull Name\nEmail Address\nResidential Address (Street, City, State)\nBank Name\nAccount Number\nDaily savings amount (1000-10000)\n\nExample:\nAda Okafor\nada@email.com\n12 Market Road, Ikeja, Lagos\nGTBank\n0123456789\n5000\n\nOnce you've done both, type DONE.`
+  return getMessage('onboarding_intro', lang, { verifyLink })
 }
 
-function buildPlanMessage(temp) {
+function buildPlanMessage(temp, lang) {
   const plan = projectPlan(temp.daily_amount)
-  return `You're verified! Here's your plan:\n\nDaily amount: N${temp.daily_amount.toLocaleString()}\nDuration: 30 days\nTotal savings: N${plan.totalSavings.toLocaleString()}\nMyAjo commission: N${plan.commission.toLocaleString()}\nYou will receive: N${plan.payout.toLocaleString()}\n\nPayout goes to:\n${temp.bank_name} - ${temp.bank_account_number}\nName: ${temp.full_name}\nEmail: ${temp.email}\nAddress: ${temp.address_display}\n\nIf this all looks correct, type CONFIRM to activate.\nIf anything needs fixing, type EDIT to re-enter your details.`
+  return getMessage('plan_message', lang, {
+    dailyAmount: temp.daily_amount.toLocaleString(),
+    totalSavings: plan.totalSavings.toLocaleString(),
+    commission: plan.commission.toLocaleString(),
+    payout: plan.payout.toLocaleString(),
+    bankName: temp.bank_name,
+    accountNumber: temp.bank_account_number,
+    fullName: temp.full_name,
+    email: temp.email,
+    address: temp.address_display,
+  })
 }
 
 async function handleMessage(from, body) {
@@ -136,9 +174,22 @@ async function handleMessage(from, body) {
   const step = session ? session.step : 'welcome'
   const temp = session ? session.temp_data : {}
 
+  // Every fresh interaction — no session at all, or an explicit
+  // MENU/START/HI/HELLO — opens with the language question, even for
+  // returning traders. This is deliberate: it's the only chance someone
+  // gets to switch language later, since we don't re-ask mid-flow.
   if (upper === 'MENU' || upper === 'START' || upper === 'HI' || upper === 'HELLO' || !session) {
-    await updateSession(whatsapp, 'main_menu', {})
-    return `Welcome to MyAjo. I am Temi, your personal savings assistant.\n\nI am here to help you build a consistent daily savings habit.\n\nPlease choose an option:\n\n1. Start Daily Savings\n2. Check My Balance\n3. Learn How It Works\n4. Speak with Support\n\nUsed MyAjo before on a different phone number? Type RECONNECT instead.\n\nReply with a number.`
+    await updateSession(whatsapp, 'select_language', {})
+    return LANGUAGE_SELECT_MESSAGE
+  }
+
+  if (step === 'select_language') {
+    const lang = LANGUAGES[message]
+    if (!lang) {
+      return `${LANGUAGE_SELECT_MESSAGE}\n\n(Please reply with just the number: 1, 2, 3, or 4.)`
+    }
+    await updateSession(whatsapp, 'main_menu', { language: lang })
+    return getMessage('welcome', lang)
   }
 
   if (upper === 'RECONNECT') {
@@ -152,22 +203,25 @@ async function handleMessage(from, body) {
     // typed into chat, no other details re-entered. If the BVN turns
     // out to be genuinely new, it's treated as a normal first-time
     // verification and they're guided into full onboarding from there.
-    await updateSession(whatsapp, 'awaiting_reconnect_verification', {})
+    const lang = getLang(temp)
+    await updateSession(whatsapp, 'awaiting_reconnect_verification', { language: lang })
     const verifyLink = `${APP_URL}/verify?ref=${whatsapp}`
-    return `No problem — verify your identity here and we'll reconnect your MyAjo account to this number automatically:\n\n${verifyLink}\n\nThis takes about a minute. You don't need to re-enter any other details — once verification completes, we'll message you here.`
+    return getMessage('reconnect_prompt', lang, { verifyLink })
   }
 
   if (step === 'awaiting_reconnect_verification') {
-    return `Still waiting on your verification to complete. If you haven't opened the link yet, here it is again:\n\n${APP_URL}/verify?ref=${whatsapp}\n\nOnce it's done, we'll message you here automatically — no need to type anything further.`
+    return getMessage('reconnect_waiting', getLang(temp), { verifyLink: `${APP_URL}/verify?ref=${whatsapp}` })
   }
 
   if (step === 'main_menu') {
+    const lang = getLang(temp)
+
     if (message === '1') {
-      return await beginNewSavingsPlan(whatsapp)
+      return await beginNewSavingsPlan(whatsapp, lang)
     }
 
     if (message === '2') {
-      await updateSession(whatsapp, 'check_balance', {})
+      await updateSession(whatsapp, 'check_balance', { language: lang })
       const user = await getUserByWhatsapp(whatsapp)
 
       if (!user) {
@@ -176,69 +230,93 @@ async function handleMessage(from, body) {
         // becomes 'welcome' next message, not 'main_menu', so the "1"
         // this message just asked for falls through to "I did not
         // understand" instead of being recognized. Reproduced live.
-        await updateSession(whatsapp, 'main_menu', {})
-        return `I could not find your account. Please type 1 to start your savings plan first.`
+        await updateSession(whatsapp, 'main_menu', { language: lang })
+        return getMessage('no_account_found', lang)
       }
 
       const cycle = await getActiveCycle(user.id)
       if (!cycle) {
-        await updateSession(whatsapp, 'main_menu', {})
-        return `You do not have an active savings cycle yet.\n\nType 1 to start your savings plan.`
+        await updateSession(whatsapp, 'main_menu', { language: lang })
+        return getMessage('no_active_cycle_balance', lang)
       }
 
       const s = getBalanceSummary(cycle)
       await clearSession(whatsapp)
-      return `Your Savings\n\nHello ${user.full_name}\n\nSaved: N${s.totalSaved.toLocaleString()}\nToday's status: ${s.daysContributed > 0 ? 'Active' : 'Not started'}\nDay ${s.cycleDayNumber} of 30 (${s.daysContributed} payment${s.daysContributed === 1 ? '' : 's'} made)\nDays remaining: ${s.daysRemaining}\n\nExpected total: N${s.expectedTotal.toLocaleString()}\nMyAjo commission: N${s.commission.toLocaleString()}\nYour payout: N${s.expectedPayout.toLocaleString()}\n\nType MENU to return to the main menu.`
+      return getMessage('balance', lang, {
+        name: user.full_name,
+        saved: s.totalSaved.toLocaleString(),
+        daysContributed: s.daysContributed,
+        progressBar: s.progressBar,
+        progressPercent: s.progressPercent,
+        expectedTotal: s.expectedTotal.toLocaleString(),
+        commission: s.commission.toLocaleString(),
+        expectedPayout: s.expectedPayout.toLocaleString(),
+        withdrawLine: s.canWithdraw
+          ? `\n\nYou can withdraw anytime. Type WITHDRAW followed by an amount.`
+          : `\n\nWithdrawals unlock on day 10 (${10 - s.cycleDayNumber} day${(10 - s.cycleDayNumber) === 1 ? '' : 's'} to go).`,
+      })
     }
 
     if (message === '3') {
-      await updateSession(whatsapp, 'main_menu', {})
+      await updateSession(whatsapp, 'main_menu', { language: lang })
       const exampleCommission = calculateCommission(1000)
       const examplePayout = 30000 - exampleCommission
-      return `How MyAjo Works\n\nMyAjo is a digital daily savings platform built on the trusted ajo tradition.\n\n1. You choose how much to save every day\n2. You save daily for 30 days\n3. At the end of 30 days you collect your full savings minus MyAjo's commission\n\nExample:\nSave N1,000 every day\nTotal after 30 days: N30,000\nMyAjo commission: N${exampleCommission.toLocaleString()}\nYou receive: N${examplePayout.toLocaleString()}\n\nNeed your money before 30 days? You can withdraw anytime after day 10 — a small fee from our banking partner applies (N50 for withdrawals up to N10,000, N100 above that). MyAjo never charges you extra for this.\n\nYour money is safe and held by our licensed banking partner.\n\nType 1 to start saving today.`
+      return getMessage('how_it_works', lang, {
+        exampleCommission: exampleCommission.toLocaleString(),
+        examplePayout: examplePayout.toLocaleString(),
+      })
     }
 
     if (message === '4') {
       await clearSession(whatsapp)
-      return `Support\n\nTo speak with our support team please send an email to hello@myajo.com.ng or call 08029708278 during business hours Monday to Friday 8am to 5pm.\n\nType MENU to return to the main menu.`
+      return getMessage('support_message', lang)
     }
 
-    return `Please reply with a number between 1 and 4 to choose an option.\n\n1. Start Daily Savings\n2. Check My Balance\n3. Learn How It Works\n4. Speak with Support`
+    return getMessage('main_menu_invalid', lang)
   }
 
   if (step === 'new_cycle_amount') {
+    const lang = getLang(temp)
     const dailyAmount = parseFloat(message.replace(/,/g, ''))
     const { valid, reason } = validateDailyAmount(dailyAmount)
     if (!valid) {
-      return `${reason}\n\nHow much would you like to save daily? (N1,000 - N10,000)`
+      // reason comes from lib/savings.js and stays English-only for now.
+      return `${reason}\n\n${getMessage('new_cycle_amount_prompt', lang)}`
     }
 
     const user = await getUserByWhatsapp(whatsapp)
     if (!user || !user.anchor_account_number) {
       console.error('new_cycle_amount: returning user missing account details at cycle start', whatsapp)
       await clearSession(whatsapp)
-      return `Something went wrong finding your account details. Please type MENU to start over, or contact support at hello@myajo.com.ng.`
+      return getMessage('new_cycle_account_error', lang)
     }
 
     await startCycle(user.id, dailyAmount)
     await clearSession(whatsapp)
-    return `Your savings plan is now active!\n\n${user.full_name} your new MyAjo journey has begun.\n\nSend your daily savings of N${dailyAmount.toLocaleString()} to your existing account:\n\nAccount Number: ${user.anchor_account_number}\n(This is your dedicated MyAjo savings account, held with our licensed banking partner.)\n\nWhen your transfer goes through, we will confirm it automatically. You can also type PAID anytime to check.\n\nGood luck and stay consistent!`
+    return getMessage('cycle_activated', lang, {
+      name: user.full_name,
+      dailyAmount: dailyAmount.toLocaleString(),
+      accountNumber: user.anchor_account_number,
+      isNew: false,
+    })
   }
 
   if (step === 'onboarding') {
+    const lang = getLang(temp)
+
     if (upper === 'DONE') {
       const user = await getUserByWhatsapp(whatsapp)
 
       if (!temp.full_name) {
-        return `I haven't received your details yet. Please send your full name, email, residential address, bank name, account number, and daily amount — each on its own line — then type DONE again.`
+        return getMessage('onboarding_details_missing', lang)
       }
 
       if (!user || user.kyc_status !== 'verified') {
         if (user && user.kyc_status === 'failed') {
           const verifyLink = `${APP_URL}/verify?ref=${whatsapp}`
-          return `Hmm, we couldn't verify your details. This usually happens if the photo was blurry or didn't match your BVN.\n\nPlease try again here: ${verifyLink}\n\nThen type DONE.`
+          return getMessage('verification_failed', lang, { verifyLink })
         }
-        return `Still checking your verification, this usually takes just a moment. Please type DONE again in a minute.`
+        return getMessage('still_checking_verification', lang)
       }
 
       if (!temp.bank_verified) {
@@ -247,11 +325,11 @@ async function handleMessage(from, body) {
           bankResult = await verifyAndLinkBankAccount(user.id, temp.bank_name, temp.bank_account_number)
         } catch (err) {
           console.error('DONE: bank verification threw unexpectedly', whatsapp, err)
-          return `We hit a snag verifying your bank details (${err.message}). Please type DONE again in a moment, or type EDIT to re-enter your details.`
+          return getMessage('bank_verify_error', lang, { err: err.message })
         }
 
         if (bankResult.retype) {
-          return `We couldn't find a bank matching "${temp.bank_name}". Please resend all 6 details with the correct bank name.`
+          return getMessage('bank_not_found', lang, { bankName: temp.bank_name })
         }
 
         if (bankResult.needsSelection) {
@@ -261,7 +339,7 @@ async function handleMessage(from, body) {
             userId: user.id,
             bankCandidates: bankResult.candidates,
           })
-          return `A few banks matched "${temp.bank_name}" — which one is it?\n\n${numbered}\n\nReply with the number.`
+          return getMessage('bank_selection', lang, { bankName: temp.bank_name, numbered })
         }
 
         temp.bank_name = bankResult.bankName
@@ -269,10 +347,10 @@ async function handleMessage(from, body) {
       }
 
       await updateSession(whatsapp, 'confirm_plan', temp)
-      return buildPlanMessage(temp)
+      return buildPlanMessage(temp, lang)
     }
 
-    const parsed = parseOnboardingDetails(message)
+    const parsed = parseOnboardingDetails(message, lang)
     if (!parsed.valid) {
       return parsed.reason
     }
@@ -281,12 +359,13 @@ async function handleMessage(from, body) {
   }
 
   if (step === 'select_bank') {
+    const lang = getLang(temp)
     const choice = parseInt(message, 10)
     const candidates = temp.bankCandidates || []
 
     if (isNaN(choice) || choice < 1 || choice > candidates.length) {
       const numbered = candidates.map((c, i) => `${i + 1}. ${c.name}`).join('\n')
-      return `Please reply with just the number of your bank:\n\n${numbered}`
+      return getMessage('select_bank_invalid', lang, { numbered })
     }
 
     const chosen = candidates[choice - 1]
@@ -295,15 +374,17 @@ async function handleMessage(from, body) {
       bankResult = await verifyAndLinkResolvedBank(temp.userId, chosen, temp.bank_account_number)
     } catch (err) {
       console.error('select_bank: verification failed', temp.userId, chosen, err)
-      return `We hit a snag verifying that account (${err.message}). Please reply with the number again, or type MENU to start over.`
+      return getMessage('select_bank_error', lang, { err: err.message })
     }
 
     const updatedTemp = { ...temp, bank_name: bankResult.bankName, bank_verified: true }
     await updateSession(whatsapp, 'confirm_plan', updatedTemp)
-    return buildPlanMessage(updatedTemp)
+    return buildPlanMessage(updatedTemp, lang)
   }
 
   if (step === 'confirm_plan') {
+    const lang = getLang(temp)
+
     if (upper === 'CONFIRM') {
       const userId = await createOrUpdateAccount(whatsapp, {
         full_name: temp.full_name,
@@ -311,6 +392,7 @@ async function handleMessage(from, body) {
         bank_name: temp.bank_name,
         bank_account_number: temp.bank_account_number,
         residential_address: temp.address_display,
+        language: lang,
       })
 
       let anchorResult
@@ -318,7 +400,7 @@ async function handleMessage(from, body) {
         anchorResult = await provisionAnchorAccount(userId, temp.address)
       } catch (err) {
         console.error('CONFIRM: Anchor provisioning failed', whatsapp, err)
-        return `We hit a snag setting up your deposit account (${err.message}). Please type CONFIRM again in a moment — if it keeps happening, type HELP to reach support.`
+        return getMessage('anchor_provision_error', lang, { err: err.message })
       }
 
       // Rare case: verification was already approved on an earlier
@@ -327,32 +409,38 @@ async function handleMessage(from, body) {
       if (anchorResult.status === 'ready') {
         await startCycle(userId, temp.daily_amount)
         await clearSession(whatsapp)
-        return `Your savings plan is now active!\n\n${temp.full_name} your MyAjo journey has begun.\n\nSend your daily savings of N${parseFloat(temp.daily_amount).toLocaleString()} to this account:\n\nAccount Number: ${anchorResult.accountNumber}\n(This is your dedicated MyAjo savings account, held with our licensed banking partner.)\n\nWhen your transfer goes through, we will confirm it automatically. You can also type PAID anytime to check.\n\nGood luck and stay consistent!`
+        return getMessage('cycle_activated', lang, {
+          name: temp.full_name,
+          dailyAmount: parseFloat(temp.daily_amount).toLocaleString(),
+          accountNumber: anchorResult.accountNumber,
+          isNew: true,
+        })
       }
 
       // Normal case: verification was just triggered and Anchor hasn't
       // responded yet. Stash daily_amount in session so the webhook
       // (app/api/anchor-webhook/route.js) can start the cycle itself
       // once approval comes back — no cycle exists yet at this point.
-      await updateSession(whatsapp, 'awaiting_kyc_approval', { daily_amount: temp.daily_amount })
-      return `Thanks ${temp.full_name}! We're verifying your details with our banking partner now — this usually takes a few moments.\n\nWe'll message you here the second your savings account is ready. No need to do anything else for now.`
+      await updateSession(whatsapp, 'awaiting_kyc_approval', { daily_amount: temp.daily_amount, language: lang })
+      return getMessage('kyc_pending', lang, { fullName: temp.full_name })
     }
     if (upper === 'EDIT') {
-      await updateSession(whatsapp, 'onboarding', {})
+      await updateSession(whatsapp, 'onboarding', { language: lang })
       const verifyLink = `${APP_URL}/verify?ref=${whatsapp}`
-      return `No problem, let's redo your details.\n\nPlease reply with your details in this format (one per line):\n\nFull Name\nEmail Address\nResidential Address (Street, City, State)\nBank Name\nAccount Number\nDaily savings amount (1000-10000)\n\nExample:\nAda Okafor\nada@email.com\n12 Market Road, Ikeja, Lagos\nGTBank\n0123456789\n5000\n\nIf you still need to verify your identity, do that here too:\n${verifyLink}\n\nOnce done, type DONE.`
+      return getMessage('edit_redo_details', lang, { verifyLink })
     }
     if (upper === 'CANCEL') {
       await clearSession(whatsapp)
-      return `No problem. Type MENU whenever you are ready to start your savings plan.`
+      return getMessage('cancel_confirmation', lang)
     }
-    return `Please type CONFIRM to activate your plan, EDIT to fix your details, or CANCEL to start over.`
+    return getMessage('confirm_plan_prompt', lang)
   }
 
   if (step === 'awaiting_kyc_approval') {
+    const lang = getLang(temp)
     const user = await getUserByWhatsapp(whatsapp)
     if (!user) {
-      return `Still verifying your details with our banking partner — almost there. We'll message you here as soon as your savings account is ready.`
+      return getMessage('awaiting_kyc_waiting', lang)
     }
 
     let result
@@ -360,34 +448,40 @@ async function handleMessage(from, body) {
       result = await checkAndFinalizeIfApproved(user.id)
     } catch (err) {
       console.error('awaiting_kyc_approval: check failed', whatsapp, err)
-      return `Still verifying your details with our banking partner — almost there. We'll message you here as soon as your savings account is ready.`
+      return getMessage('awaiting_kyc_waiting', lang)
     }
 
     if (result.status === 'ready') {
       await startCycle(user.id, temp.daily_amount)
       await clearSession(whatsapp)
-      return `Your savings plan is now active!\n\n${user.full_name} your MyAjo journey has begun.\n\nSend your daily savings of N${parseFloat(temp.daily_amount).toLocaleString()} to this account:\n\nAccount Number: ${result.accountNumber}\n(This is your dedicated MyAjo savings account, held with our licensed banking partner.)\n\nWhen your transfer goes through, we will confirm it automatically. You can also type PAID anytime to check.\n\nGood luck and stay consistent!`
+      return getMessage('cycle_activated', lang, {
+        name: user.full_name,
+        dailyAmount: parseFloat(temp.daily_amount).toLocaleString(),
+        accountNumber: result.accountNumber,
+        isNew: true,
+      })
     }
 
     if (result.status === 'rejected') {
       await clearSession(whatsapp)
-      return `We could not verify your details with our banking partner. This usually happens if your name, phone number, or BVN details don't match. Please contact support at hello@myajo.com.ng and we will help sort this out.`
+      return getMessage('awaiting_kyc_rejected', lang)
     }
 
-    return `Still verifying your details with our banking partner — almost there. We'll message you here as soon as your savings account is ready.`
+    return getMessage('awaiting_kyc_waiting', lang)
   }
 
   if (step === 'cycle_complete') {
     if (upper === 'YES') {
-      return await beginNewSavingsPlan(whatsapp)
+      return await beginNewSavingsPlan(whatsapp, getLang(temp))
     }
-    return `Type YES to start a new 30-day savings cycle, or MENU to see all options.`
+    return getMessage('cycle_complete_prompt', getLang(temp))
   }
 
   if (upper === 'PAID') {
     const user = await getUserByWhatsapp(whatsapp)
+    const lang = (user && user.language) || getLang(temp)
     if (!user) {
-      return `I could not find your account. Type MENU to get started.`
+      return getMessage('no_account_found', lang)
     }
 
     const cycle = await getActiveCycle(user.id)
@@ -397,122 +491,144 @@ async function handleMessage(from, body) {
       // into 'main_menu', so "1" fell through to "I did not
       // understand". Reproduced live: PAID -> "type 1" -> "1" ->
       // fallback -> had to type MENU, then 1, to actually get through.
-      await updateSession(whatsapp, 'main_menu', {})
-      return `You do not have an active savings cycle. Type 1 to start one.`
+      await updateSession(whatsapp, 'main_menu', { language: lang })
+      return getMessage('no_active_cycle_generic', lang)
     }
 
-    const paidToday = await getTodaysContribution(cycle.id)
+      const paidToday = await getTodaysContribution(cycle.id)
     if (paidToday) {
       // Calendar day, not payment count — matches the webhook's
       // confirmation message and the fixed 30-calendar-day cycle rule.
       const cycleDayNumber = Math.min(getCycleDayNumber(cycle.start_date), 30)
       const daysRemaining = Math.max(30 - cycleDayNumber, 0)
+      // contribution_recorded is a WhatsApp Message Template — English
+      // only until translated versions are submitted for approval in
+      // Meta Business Manager (see lib/messages.js PHASE 1B note).
       return getMessage('contribution_recorded', 'en', {
         amount: parseFloat(cycle.daily_amount).toLocaleString(),
         dayNumber: cycleDayNumber,
         totalSaved: parseFloat(cycle.total_saved).toLocaleString(),
         daysRemaining,
-      })
+        })
     }
-
-    return `We haven't received your transfer yet. Bank transfers can take a few minutes to reflect — Temi will confirm automatically as soon as it comes in. If it's been more than 30 minutes, type HELP to contact support.`
+ 
+    return getMessage('paid_not_received', lang)
   }
-
+ 
   if (upper.startsWith('SAVE')) {
-    return `We've simplified this — you no longer need to send a reference number. Just make your transfer, then reply PAID and Temi will confirm it for you.`
+    return getMessage('save_deprecated', getLang(temp))
   }
-
+ 
   if (upper === 'BALANCE') {
     const user = await getUserByWhatsapp(whatsapp)
     if (!user) {
-      return `I could not find your account. Type MENU to get started.`
+      return getMessage('no_account_found', getLang(temp))
     }
-
+    const lang = user.language || 'en'
+ 
     const cycle = await getActiveCycle(user.id)
-    if (!cycle) {
-      await updateSession(whatsapp, 'main_menu', {})
-      return `You do not have an active savings cycle.\n\nType 1 to start saving today.`
+   if (!cycle) {
+      await updateSession(whatsapp, 'main_menu', { language: lang })
+      return getMessage('no_active_cycle_balance', lang)
     }
-
+ 
     const s = getBalanceSummary(cycle)
     const daysToUnlock = 10 - s.cycleDayNumber
     const withdrawLine = s.canWithdraw
       ? `\n\nYou can withdraw anytime. Type WITHDRAW followed by an amount.`
-      : `\n\nWithdrawals unlock on day 10 (${daysToUnlock} day${daysToUnlock === 1 ? '' : 's'} to go).`
+      : `\n\nWithdrawals unlock on day 10 (${daysToUnlock} day${daysToUnlock === 1 ? '' : 's'} to go).` 
 
-    return `Your Savings\n\nHello ${user.full_name}\n\nSaved: N${s.totalSaved.toLocaleString()}\nDay ${s.cycleDayNumber} of 30 (${s.daysContributed} payment${s.daysContributed === 1 ? '' : 's'} made)\n\nProgress: ${s.progressBar} ${s.progressPercent}%\n\nExpected total: N${s.expectedTotal.toLocaleString()}\nMyAjo commission: N${s.commission.toLocaleString()}\nYour payout: N${s.expectedPayout.toLocaleString()}${withdrawLine}\n\nKeep saving every day!`
+    return getMessage('balance', lang, {
+      name: user.full_name,
+      saved: s.totalSaved.toLocaleString(),
+      daysContributed: s.daysContributed,
+      progressBar: s.progressBar,
+      progressPercent: s.progressPercent,
+      expectedTotal: s.expectedTotal.toLocaleString(),
+      commission: s.commission.toLocaleString(),
+      expectedPayout: s.expectedPayout.toLocaleString(),
+      withdrawLine,
+    })
   }
-
+ 
   if (upper.startsWith('WITHDRAW')) {
     const parts = message.split(' ')
     const amount = parseFloat((parts[1] || '').replace(/,/g, ''))
 
     const user = await getUserByWhatsapp(whatsapp)
     if (!user) {
-      return `I could not find your account. Type MENU to get started.`
+      return getMessage('no_account_found', getLang(temp))
     }
-
+    const lang = user.language || 'en'
+ 
     const cycle = await getActiveCycle(user.id)
     if (!cycle) {
-      await updateSession(whatsapp, 'main_menu', {})
-      return `You do not have an active savings cycle. Type 1 to start one.`
-    }
-
-    if (isNaN(amount)) {
-      return `To withdraw, send WITHDRAW followed by the amount.\n\nExample: WITHDRAW 5000`
+      await updateSession(whatsapp, 'main_menu', { language: lang })
+      return getMessage('no_active_cycle_generic', lang)
     }
  
-    const quote = await quoteWithdrawalForCycle(cycle, amount)
+    if (isNaN(amount)) {
+      return getMessage('withdraw_usage', lang)
+    }
+
+  const quote = await quoteWithdrawalForCycle(cycle, amount)
     if (!quote.allowed) {
+      // quote.reason comes from lib/withdrawal.js and stays
+      // English-only for now — same known gap as lib/savings.js.
       return quote.reason
     }
  
     await updateSession(whatsapp, 'awaiting_withdrawal_confirmation', {
       cycleId: cycle.id,
       requestedAmount: quote.requestedAmount,
+      language: lang,
     })
+    // quote.confirmationMessage comes from lib/withdrawal.js and stays
+    // English-only for now, same known gap.
     return quote.confirmationMessage
   }
- 
-  if (upper === 'YES' && step === 'awaiting_withdrawal_confirmation') {
+
+if (upper === 'YES' && step === 'awaiting_withdrawal_confirmation') {
+    const lang = getLang(temp)
     const result = await processWithdrawal(temp.cycleId, temp.requestedAmount, anchorPayout)
  
     if (!result.success) {
       await clearSession(whatsapp)
-      return `Withdrawal could not be completed: ${result.reason}`
+      return getMessage('withdrawal_failed', lang, { reason: result.reason })
     }
  
     if (result.cycleEnded) {
-      await updateSession(whatsapp, 'cycle_complete', {})
-      return `N${result.netAmount.toLocaleString()} is on its way to your account.\n\nYour savings cycle has ended.\n\nReady to begin your next cycle? Type YES.`
+      await updateSession(whatsapp, 'cycle_complete', { language: lang })
+      return getMessage('withdrawal_cycle_ended', lang, { netAmount: result.netAmount.toLocaleString() })
     }
- 
-    await clearSession(whatsapp)
-    return `N${result.netAmount.toLocaleString()} is on its way to your account.`
+
+  await clearSession(whatsapp)
+    return getMessage('withdrawal_success', lang, { netAmount: result.netAmount.toLocaleString() })
   }
  
   if (upper === 'NO' && step === 'awaiting_withdrawal_confirmation') {
     await clearSession(whatsapp)
-    return `Withdrawal cancelled. Your savings are untouched.`
+    return getMessage('withdrawal_cancelled', getLang(temp))
   }
  
   if (upper === 'FREEZE') {
     const user = await getUserByWhatsapp(whatsapp)
     if (!user) {
-      return `I could not find your account. Please contact support immediately.`
+      return getMessage('freeze_no_account', getLang(temp))
     }
- 
+
+
     await freezeAccount(user.id)
-    return `Your MyAjo account has been frozen immediately ${user.full_name}. No transactions can be made until you contact our support team to unfreeze it.\n\nContact us at hello@myajo.com.ng or call 08029708278.`
+    return getMessage('freeze_confirmation', user.language || 'en', { name: user.full_name })
   }
  
   if (upper === 'HELP') {
-    return `Temi Commands\n\nMENU - Return to main menu\nBALANCE - Check your savings\nPAID - Confirm today's transfer has gone through\nWITHDRAW 5000 - Withdraw an amount from your savings (available from day 10)\nFREEZE - Freeze your account\nHELP - Show this menu\n\nWithdrawing before your 30 day cycle ends attracts a small charge from our banking partner (N50 up to N10,000, N100 above that). MyAjo never adds anything on top. Complete the full cycle and there is no charge at all.\n\nFor support contact hello@myajo.com.ng`
+    const user = await getUserByWhatsapp(whatsapp)
+    return getMessage('help', (user && user.language) || getLang(temp))
   }
  
-  return `I did not understand that. Type MENU to see your options or HELP to see all commands.`
+  return getMessage('fallback_not_understood', getLang(temp))
 }
- 
 export async function GET(request) {
   const { searchParams } = new URL(request.url)
   const mode = searchParams.get('hub.mode')
@@ -525,8 +641,8 @@ export async function GET(request) {
  
   return new NextResponse('Verification failed', { status: 403 })
 }
- 
-export async function POST(request) {
+
+  export async function POST(request) {
   try {
     const payload = await request.json()
     const entry = payload.entry?.[0]
@@ -544,10 +660,10 @@ export async function POST(request) {
     if (responseText) {
       await sendMessage(from, responseText)
     }
- 
+
     return new NextResponse('OK', { status: 200 })
   } catch (error) {
     console.error('Webhook error:', error)
     return new NextResponse('Error', { status: 500 })
   }
-        }
+  }
