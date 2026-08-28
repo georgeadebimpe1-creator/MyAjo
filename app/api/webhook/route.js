@@ -5,7 +5,7 @@ import { getMessage, LANGUAGES, LANGUAGE_SELECT_MESSAGE } from '../../lib/messag
 import { quoteWithdrawalForCycle, processWithdrawal } from '../../lib/withdrawal'
 import { anchorPayout } from '../../lib/payout'
 import { getSession, updateSession, clearSession } from '../../lib/session'
-import { getUserByWhatsapp, createOrUpdateAccount, freezeAccount, provisionAnchorAccount, checkAndFinalizeIfApproved, verifyAndLinkBankAccount, verifyAndLinkResolvedBank } from '../../lib/accounts'
+import { getUserByWhatsapp, createOrUpdateAccount, freezeAccount, provisionAnchorAccount, checkAndFinalizeIfApproved, verifyAndLinkBankAccount, verifyAndLinkResolvedBank, updateUserLanguage } from '../../lib/accounts'
 import { getActiveCycle, startCycle, getBalanceSummary, getTodaysContribution, projectPlan, validateDailyAmount, calculateCommission, getCycleDayNumber } from '../../lib/savings'
 
 const META_VERIFY_TOKEN = process.env.META_VERIFY_TOKEN
@@ -189,6 +189,14 @@ async function handleMessage(from, body) {
       return `${LANGUAGE_SELECT_MESSAGE}\n\n(Please reply with just the number: 1, 2, 3, or 4.)`
     }
     await updateSession(whatsapp, 'main_menu', { language: lang })
+    // Persist for a RETURNING trader too, not just this session. A
+    // brand-new signup's language gets written once, correctly, later —
+    // at account creation in createOrUpdateAccount() — so this only
+    // needs to act when a users row already exists.
+    const existingUser = await getUserByWhatsapp(whatsapp)
+    if (existingUser) {
+      await updateUserLanguage(whatsapp, lang)
+    }
     return getMessage('welcome', lang)
   }
 
@@ -494,11 +502,12 @@ async function handleMessage(from, body) {
       await updateSession(whatsapp, 'main_menu', { language: lang })
       return getMessage('no_active_cycle_generic', lang)
     }
-
+ 
       const paidToday = await getTodaysContribution(cycle.id)
     if (paidToday) {
       // Calendar day, not payment count — matches the webhook's
       // confirmation message and the fixed 30-calendar-day cycle rule.
+      const cycleDayNumber = Math.min(getCycleDayNumber(cycle.start_date), 30)
       const cycleDayNumber = Math.min(getCycleDayNumber(cycle.start_date), 30)
       const daysRemaining = Math.max(30 - cycleDayNumber, 0)
       // contribution_recorded is a WhatsApp Message Template — English
@@ -513,8 +522,7 @@ async function handleMessage(from, body) {
     }
  
     return getMessage('paid_not_received', lang)
-  }
- 
+        }
   if (upper.startsWith('SAVE')) {
     return getMessage('save_deprecated', getLang(temp))
   }
@@ -531,13 +539,13 @@ async function handleMessage(from, body) {
       await updateSession(whatsapp, 'main_menu', { language: lang })
       return getMessage('no_active_cycle_balance', lang)
     }
- 
-    const s = getBalanceSummary(cycle)
+
+  const s = getBalanceSummary(cycle)
     const daysToUnlock = 10 - s.cycleDayNumber
     const withdrawLine = s.canWithdraw
       ? `\n\nYou can withdraw anytime. Type WITHDRAW followed by an amount.`
       : `\n\nWithdrawals unlock on day 10 (${daysToUnlock} day${daysToUnlock === 1 ? '' : 's'} to go).` 
-
+ 
     return getMessage('balance', lang, {
       name: user.full_name,
       saved: s.totalSaved.toLocaleString(),
@@ -550,11 +558,11 @@ async function handleMessage(from, body) {
       withdrawLine,
     })
   }
- 
-  if (upper.startsWith('WITHDRAW')) {
+
+if (upper.startsWith('WITHDRAW')) {
     const parts = message.split(' ')
     const amount = parseFloat((parts[1] || '').replace(/,/g, ''))
-
+ 
     const user = await getUserByWhatsapp(whatsapp)
     if (!user) {
       return getMessage('no_account_found', getLang(temp))
@@ -566,11 +574,11 @@ async function handleMessage(from, body) {
       await updateSession(whatsapp, 'main_menu', { language: lang })
       return getMessage('no_active_cycle_generic', lang)
     }
- 
-    if (isNaN(amount)) {
+
+  if (isNaN(amount)) {
       return getMessage('withdraw_usage', lang)
     }
-
+ 
   const quote = await quoteWithdrawalForCycle(cycle, amount)
     if (!quote.allowed) {
       // quote.reason comes from lib/withdrawal.js and stays
@@ -585,9 +593,9 @@ async function handleMessage(from, body) {
     })
     // quote.confirmationMessage comes from lib/withdrawal.js and stays
     // English-only for now, same known gap.
-    return quote.confirmationMessage
+  return quote.confirmationMessage
   }
-
+ 
 if (upper === 'YES' && step === 'awaiting_withdrawal_confirmation') {
     const lang = getLang(temp)
     const result = await processWithdrawal(temp.cycleId, temp.requestedAmount, anchorPayout)
@@ -618,7 +626,7 @@ if (upper === 'YES' && step === 'awaiting_withdrawal_confirmation') {
     }
 
 
-    await freezeAccount(user.id)
+ await freezeAccount(user.id)
     return getMessage('freeze_confirmation', user.language || 'en', { name: user.full_name })
   }
  
@@ -634,14 +642,14 @@ export async function GET(request) {
   const mode = searchParams.get('hub.mode')
   const token = searchParams.get('hub.verify_token')
   const challenge = searchParams.get('hub.challenge')
- 
-  if (mode === 'subscribe' && token === META_VERIFY_TOKEN) {
+
+if (mode === 'subscribe' && token === META_VERIFY_TOKEN) {
     return new NextResponse(challenge, { status: 200 })
   }
  
   return new NextResponse('Verification failed', { status: 403 })
 }
-
+ 
   export async function POST(request) {
   try {
     const payload = await request.json()
@@ -652,7 +660,7 @@ export async function GET(request) {
     if (!message || message.type !== 'text') {
       return new NextResponse('OK', { status: 200 })
     }
- 
+
     const from = message.from
     const body = message.text.body
  
@@ -660,7 +668,7 @@ export async function GET(request) {
     if (responseText) {
       await sendMessage(from, responseText)
     }
-
+ 
     return new NextResponse('OK', { status: 200 })
   } catch (error) {
     console.error('Webhook error:', error)
