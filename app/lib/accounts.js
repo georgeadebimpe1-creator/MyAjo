@@ -465,4 +465,21 @@ export async function checkAndFinalizeIfApproved(userId) {
   // account creation right now instead of waiting further.
   const account = await finalizeAnchorDepositAccount(userId)
   return { status: 'ready', accountNumber: account.accountNumber }
-      }
+}
+
+// Called from webhook/route.js at the top of every inbound message, so
+// last_inbound_at always reflects the trader's real last contact — this
+// is what isWindowOpen() in lib/whatsapp.js checks before deciding text
+// vs template for proactive sends (daily_reminder, contribution_recorded,
+// cycle_complete). Best-effort: a failed write here shouldn't block the
+// trader's message from being processed.
+export async function updateLastInboundAt(whatsapp) {
+  const { error } = await supabaseAdmin
+    .from('users')
+    .update({ last_inbound_at: new Date().toISOString() })
+    .eq('whatsapp_number', whatsapp)
+
+  if (error) {
+    console.error('updateLastInboundAt: update failed', whatsapp, error)
+  }
+}
