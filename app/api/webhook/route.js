@@ -172,7 +172,7 @@ async function handleMessage(from, body) {
   const upper = message.toUpperCase()
   const session = await getSession(whatsapp)
   const step = session ? session.step : 'welcome'
-  const temp = session ? session.temp_data : {]
+  const temp = session ? session.temp_data : {}
 
   // Every fresh interaction — no session at all, or an explicit
   // MENU/START/HI/HELLO — opens with the language question, even for
