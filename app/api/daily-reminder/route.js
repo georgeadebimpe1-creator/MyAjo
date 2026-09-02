@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { supabase } from '../../lib/supabase'
-import { sendMessage } from '../../lib/whatsapp'
+import { sendMessage, sendProactiveMessage } from '../../lib/whatsapp'
 import { getMessage } from '../../lib/messages'
 import { getCycleDayNumber } from '../../lib/savings'
 import { getWithdrawableBalance, processWithdrawal } from '../../lib/withdrawal'
@@ -19,7 +19,7 @@ export async function GET(request) {
 
   const { data: cycles, error } = await supabase
     .from('cycles')
-    .select('id, daily_amount, days_contributed, total_saved, commission, start_date, user_id, users(full_name, whatsapp_number)')
+    .select('id, daily_amount, days_contributed, total_saved, commission, start_date, user_id, users(full_name, whatsapp_number, last_inbound_at, language)')
     .eq('status', 'active')
 
   if (error) {
@@ -40,6 +40,7 @@ export async function GET(request) {
     // was actually saved. Runs once a day, same schedule as reminders,
     // so a cycle closes on the day it's due at the latest.
     const cycleDayNumber = getCycleDayNumber(cycle.start_date)
+    const lang = cycle.users?.language || 'en'
 
     if (cycleDayNumber >= 30) {
       if (!cycle.users?.whatsapp_number) {
@@ -50,12 +51,25 @@ export async function GET(request) {
       const result = await processWithdrawal(cycle.id, withdrawableBalance, anchorPayout)
 
       if (result.success && cycle.users?.whatsapp_number) {
-        const message = getMessage('cycle_complete', 'en', {
-          totalSaved: parseFloat(cycle.total_saved).toLocaleString(),
-          commission: parseFloat(cycle.commission).toLocaleString(),
-          netPayout: result.netAmount.toLocaleString(),
+        await sendProactiveMessage(cycle.users.whatsapp_number, {
+          userId: cycle.user_id,
+          lastInboundAt: cycle.users.last_inbound_at,
+          messageType: 'cycle_complete',
+          language: lang,
+          textBody: getMessage('cycle_complete', lang, {
+            totalSaved: parseFloat(cycle.total_saved).toLocaleString(),
+            commission: parseFloat(cycle.commission).toLocaleString(),
+            netPayout: result.netAmount.toLocaleString(),
+          }),
+          templateComponents: [{
+            type: 'body',
+            parameters: [
+              { type: 'text', text: parseFloat(cycle.total_saved).toLocaleString() },
+              { type: 'text', text: parseFloat(cycle.commission).toLocaleString() },
+              { type: 'text', text: result.netAmount.toLocaleString() },
+            ],
+          }],
         })
-        await sendMessage(cycle.users.whatsapp_number, message)
       } else if (!result.success) {
         console.error('Daily reminder: day-30 auto-close failed, needs manual reconciliation', { cycleId: cycle.id, reason: result.reason })
       }
@@ -81,12 +95,23 @@ export async function GET(request) {
       continue
     }
 
-    const message = getMessage('daily_reminder', 'en', {
-      dailyAmount: parseFloat(cycle.daily_amount).toLocaleString(),
-      streakDays: cycle.days_contributed,
+    await sendProactiveMessage(cycle.users.whatsapp_number, {
+      userId: cycle.user_id,
+      lastInboundAt: cycle.users.last_inbound_at,
+      messageType: 'daily_reminder',
+      language: lang,
+      textBody: getMessage('daily_reminder', lang, {
+        dailyAmount: parseFloat(cycle.daily_amount).toLocaleString(),
+        streakDays: cycle.days_contributed,
+      }),
+      templateComponents: [{
+        type: 'body',
+        parameters: [
+          { type: 'text', text: parseFloat(cycle.daily_amount).toLocaleString() },
+          { type: 'text', text: String(cycle.days_contributed) },
+        ],
+      }],
     })
-
-    await sendMessage(cycle.users.whatsapp_number, message)
     sent++
   }
 
