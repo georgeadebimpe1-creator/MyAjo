@@ -116,5 +116,4 @@ export async function GET(request) {
   }
 
   return NextResponse.json({ ok: true, sent, skipped, closed })
-
-  ]
+}
