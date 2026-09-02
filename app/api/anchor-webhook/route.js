@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { supabaseAdmin } from '../../lib/supabase'
-import { sendMessage } from '../../lib/whatsapp'
+import { sendMessage, sendProactiveMessage } from '../../lib/whatsapp'
 import { getMessage } from '../../lib/messages'
 import { getWithdrawableBalance, processWithdrawal } from '../../lib/withdrawal'
 import { anchorPayout } from '../../lib/payout'
@@ -167,7 +167,7 @@ export async function POST(request) {
 
     const { data: user, error: userErr } = await supabaseAdmin
       .from('users')
-      .select('id, full_name, whatsapp_number')
+      .select('id, full_name, whatsapp_number, last_inbound_at, language')
       .eq('anchor_account_id', anchorAccountId)
       .single()
 
@@ -383,29 +383,70 @@ export async function POST(request) {
         await updateSession(user.whatsapp_number, 'cycle_complete', {})
       }
 
-      const message = result.success
-        ? getMessage('cycle_complete', 'en', {
+      const lang = user.language || 'en'
+
+      if (result.success) {
+        await sendProactiveMessage(user.whatsapp_number, {
+          userId: user.id,
+          lastInboundAt: user.last_inbound_at,
+          messageType: 'cycle_complete',
+          language: lang,
+          textBody: getMessage('cycle_complete', lang, {
             totalSaved: newTotal.toLocaleString(),
             commission: commission.toLocaleString(),
             netPayout: result.netAmount.toLocaleString(),
-          })
-        : `Congratulations ${user.full_name}!\n\nYou have completed your 30 day savings plan, but your payout could not be processed automatically (${result.reason}).\n\nPlease contact support at hello@myajo.com.ng and we will resolve this right away.`
+          }),
+          templateComponents: [{
+            type: 'body',
+            parameters: [
+              { type: 'text', text: newTotal.toLocaleString() },
+              { type: 'text', text: commission.toLocaleString() },
+              { type: 'text', text: result.netAmount.toLocaleString() },
+            ],
+          }],
+        })
+      } else {
+        // Rare failure path needing admin follow-up regardless — no
+        // approved template registered for this one, so this stays a
+        // direct text send. If the window happens to be closed here
+        // too, it may not deliver; the underlying failure is already
+        // logged above for manual reconciliation either way.
+        await sendMessage(
+          user.whatsapp_number,
+          `Congratulations ${user.full_name}!\n\nYou have completed your 30 day savings plan, but your payout could not be processed automatically (${result.reason}).\n\nPlease contact support at hello@myajo.com.ng and we will resolve this right away.`,
+          { messageType: 'cycle_complete_failed', userId: user.id }
+        )
+      }
 
-      await sendMessage(user.whatsapp_number, message)
       return new NextResponse('OK', { status: 200 })
     }
 
     // Regular day — send the compact confirmation. dayNumber is the
     // calendar day (cycleDayNumber), matching what BALANCE and the
     // day-30 completion trigger now use — not the payment count.
-    const message = getMessage('contribution_recorded', 'en', {
-      amount: amountNaira.toLocaleString(),
-      dayNumber: cycleDayNumber,
-      totalSaved: newTotal.toLocaleString(),
-      daysRemaining,
-    })
+    const lang = user.language || 'en'
 
-    await sendMessage(user.whatsapp_number, message)
+    await sendProactiveMessage(user.whatsapp_number, {
+      userId: user.id,
+      lastInboundAt: user.last_inbound_at,
+      messageType: 'contribution_recorded',
+      language: lang,
+      textBody: getMessage('contribution_recorded', lang, {
+        amount: amountNaira.toLocaleString(),
+        dayNumber: cycleDayNumber,
+        totalSaved: newTotal.toLocaleString(),
+        daysRemaining,
+      }),
+      templateComponents: [{
+        type: 'body',
+        parameters: [
+          { type: 'text', text: amountNaira.toLocaleString() },
+          { type: 'text', text: String(cycleDayNumber) },
+          { type: 'text', text: newTotal.toLocaleString() },
+          { type: 'text', text: String(daysRemaining) },
+        ],
+      }],
+    })
     return new NextResponse('OK', { status: 200 })
   } catch (error) {
     console.error('Anchor webhook error:', error)
