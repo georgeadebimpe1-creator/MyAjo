@@ -5,7 +5,7 @@ import { getMessage, LANGUAGES, LANGUAGE_SELECT_MESSAGE } from '../../lib/messag
 import { quoteWithdrawalForCycle, processWithdrawal } from '../../lib/withdrawal'
 import { anchorPayout } from '../../lib/payout'
 import { getSession, updateSession, clearSession } from '../../lib/session'
-import { getUserByWhatsapp, createOrUpdateAccount, freezeAccount, provisionAnchorAccount, checkAndFinalizeIfApproved, verifyAndLinkBankAccount, verifyAndLinkResolvedBank } from '../../lib/accounts'
+import { getUserByWhatsapp, createOrUpdateAccount, freezeAccount, provisionAnchorAccount, checkAndFinalizeIfApproved, verifyAndLinkBankAccount, verifyAndLinkResolvedBank, updateLastInboundAt } from '../../lib/accounts'
 import { getActiveCycle, startCycle, getBalanceSummary, getTodaysContribution, projectPlan, validateDailyAmount, calculateCommission, getCycleDayNumber } from '../../lib/savings'
 
 const META_VERIFY_TOKEN = process.env.META_VERIFY_TOKEN
@@ -168,6 +168,13 @@ function buildPlanMessage(temp, lang) {
 
 async function handleMessage(from, body) {
   const whatsapp = from.startsWith('234') ? '0' + from.slice(3) : from
+
+  // Marks this trader's 24h window as open — the single source of truth
+  // sendProactiveMessage() (lib/whatsapp.js) checks before deciding
+  // text vs template for daily_reminder, contribution_recorded, and
+  // cycle_complete. Best-effort: doesn't block message handling if it fails.
+  await updateLastInboundAt(whatsapp)
+
   const message = body.trim()
   const upper = message.toUpperCase()
   const session = await getSession(whatsapp)
