@@ -46,6 +46,20 @@ export const TEMPLATE_NAMES = {
   cycle_complete: { en: 'myajo_cycle_complete_en' },
 }
 
+// Meta identifies template languages by locale code (e.g. 'en_US'), not
+// by the short app-level code stored on users.language ('en'). These are
+// NOT the same value — sending the app code straight through as
+// language.code causes Meta to report "template does not exist in en",
+// even though the template itself exists and is approved. CONFIRMED bug,
+// 2026-09-08: every daily_reminder attempted since Sept 3 failed this way,
+// silently, because sendTemplateMessage's caller never checked the
+// { ok: false } return value. Add an entry here for each language as its
+// templates get approved — ha/ig/yo aren't submitted yet, so they fall
+// back to 'en_US' below via metaLocale ?? META_LOCALE_CODES.en.
+export const META_LOCALE_CODES = {
+  en: 'en_US',
+}
+
 export function isWindowOpen(lastInboundAt) {
   if (!lastInboundAt) return false
   const last = new Date(lastInboundAt).getTime()
@@ -163,5 +177,11 @@ export async function sendProactiveMessage(to, {
     return sendMessage(to, textBody, { messageType, userId })
   }
 
-  return sendTemplateMessage(to, { templateName, language, components: templateComponents, messageType, userId })
+  // FIXED 2026-09-08: this used to pass `language` (the app code, e.g.
+  // 'en') straight to sendTemplateMessage as Meta's locale — Meta expects
+  // 'en_US', so every template send failed with "template does not exist
+  // in en" despite the template being approved and correctly named.
+  const metaLocale = META_LOCALE_CODES[language] || META_LOCALE_CODES.en
+
+  return sendTemplateMessage(to, { templateName, language: metaLocale, components: templateComponents, messageType, userId })
 }
