@@ -7,6 +7,7 @@ import { anchorPayout } from '../../lib/payout'
 import { getSession, updateSession, clearSession } from '../../lib/session'
 import { finalizeAnchorDepositAccount } from '../../lib/accounts'
 import { startCycle, getActiveCycle } from '../../lib/savings'
+import { sendAdminAlert } from '../../lib/alerts'
 
 // Handles the three possible outcomes of the KYC verification triggered
 // during onboarding by provisionAnchorAccount(). Only 'approved' is
@@ -386,7 +387,7 @@ export async function POST(request) {
       const lang = user.language || 'en'
 
       if (result.success) {
-        await sendProactiveMessage(user.whatsapp_number, {
+        const completeResult = await sendProactiveMessage(user.whatsapp_number, {
           userId: user.id,
           lastInboundAt: user.last_inbound_at,
           messageType: 'cycle_complete',
@@ -405,6 +406,17 @@ export async function POST(request) {
             ],
           }],
         })
+
+        // A real payout just went out — if the trader can't be told,
+        // that's a support/trust problem waiting to happen (they'll see
+        // money land with no explanation), worth a direct alert rather
+        // than only the generic console.error the send path already logs.
+        if (!completeResult?.ok) {
+          console.error('Anchor webhook: day-30 payout succeeded but notification failed', { userId: user.id, whatsapp: user.whatsapp_number })
+          await sendAdminAlert(
+            `Payout succeeded but trader could not be notified.\n\nUser ID: ${user.id}\nWhatsApp: ${user.whatsapp_number}\nNet payout: N${result.netAmount.toLocaleString()}\n\nTheir money has been sent, but they don't know it yet — worth reaching out directly.`
+          )
+        }
       } else {
         // Rare failure path needing admin follow-up regardless — no
         // approved template registered for this one, so this stays a
@@ -426,7 +438,7 @@ export async function POST(request) {
     // day-30 completion trigger now use — not the payment count.
     const lang = user.language || 'en'
 
-    await sendProactiveMessage(user.whatsapp_number, {
+    const confirmResult = await sendProactiveMessage(user.whatsapp_number, {
       userId: user.id,
       lastInboundAt: user.last_inbound_at,
       messageType: 'contribution_recorded',
@@ -447,6 +459,15 @@ export async function POST(request) {
         ],
       }],
     })
+
+    // Lower stakes than a payout notification (the trader can always
+    // check BAL themselves), so a plain log is enough here — no need for
+    // an admin alert on every missed confirmation, but worth being
+    // visible rather than silently swallowed like before.
+    if (!confirmResult?.ok) {
+      console.error('Anchor webhook: contribution_recorded send failed', { userId: user.id, whatsapp: user.whatsapp_number, cycleId: cycle.id })
+    }
+
     return new NextResponse('OK', { status: 200 })
   } catch (error) {
     console.error('Anchor webhook error:', error)
