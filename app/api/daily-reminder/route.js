@@ -5,6 +5,7 @@ import { getMessage } from '../../lib/messages'
 import { getCycleDayNumber } from '../../lib/savings'
 import { getWithdrawableBalance, processWithdrawal } from '../../lib/withdrawal'
 import { anchorPayout } from '../../lib/payout'
+import { sendAdminAlert } from '../../lib/alerts'
 
 // Vercel Cron calls this once a day with an Authorization header
 // matching CRON_SECRET. Anyone else calling this URL without that
@@ -28,6 +29,7 @@ export async function GET(request) {
   }
 
   let sent = 0
+  let failed = 0
   let skipped = 0
   let closed = 0
 
@@ -51,7 +53,7 @@ export async function GET(request) {
       const result = await processWithdrawal(cycle.id, withdrawableBalance, anchorPayout)
 
       if (result.success && cycle.users?.whatsapp_number) {
-        await sendProactiveMessage(cycle.users.whatsapp_number, {
+        const completeResult = await sendProactiveMessage(cycle.users.whatsapp_number, {
           userId: cycle.user_id,
           lastInboundAt: cycle.users.last_inbound_at,
           messageType: 'cycle_complete',
@@ -70,6 +72,17 @@ export async function GET(request) {
             ],
           }],
         })
+
+        // A real payout just went out — if the trader can't be told,
+        // that's a support/trust problem waiting to happen (they'll see
+        // money land with no explanation), worth a direct alert rather
+        // than only the generic console.error the send path already logs.
+        if (!completeResult?.ok) {
+          console.error('Daily reminder: day-30 payout succeeded but notification failed', { cycleId: cycle.id, whatsapp: cycle.users.whatsapp_number })
+          await sendAdminAlert(
+            `Payout succeeded but trader could not be notified.\n\nCycle ID: ${cycle.id}\nWhatsApp: ${cycle.users.whatsapp_number}\nNet payout: N${result.netAmount.toLocaleString()}\n\nTheir money has been sent, but they don't know it yet — worth reaching out directly.`
+          )
+        }
       } else if (!result.success) {
         console.error('Daily reminder: day-30 auto-close failed, needs manual reconciliation', { cycleId: cycle.id, reason: result.reason })
       }
@@ -95,7 +108,7 @@ export async function GET(request) {
       continue
     }
 
-    await sendProactiveMessage(cycle.users.whatsapp_number, {
+    const reminderResult = await sendProactiveMessage(cycle.users.whatsapp_number, {
       userId: cycle.user_id,
       lastInboundAt: cycle.users.last_inbound_at,
       messageType: 'daily_reminder',
@@ -112,8 +125,23 @@ export async function GET(request) {
         ],
       }],
     })
-    sent++
+
+    // FIXED 2026-09-08: this used to increment `sent` unconditionally
+    // right after the await, regardless of whether Meta actually
+    // accepted the message. That's exactly how the template
+    // language-code bug (see whatsapp.js) went unnoticed for 5 days —
+    // this endpoint kept reporting "sent: 2" every single day while
+    // every one of those sends was actually failing. `sent` now only
+    // counts confirmed successes; `failed` makes real delivery problems
+    // visible in the response itself instead of requiring someone to
+    // separately check Vercel's error logs to notice.
+    if (reminderResult?.ok) {
+      sent++
+    } else {
+      failed++
+      console.error('Daily reminder: send failed for', cycle.users.whatsapp_number, 'cycle', cycle.id)
+    }
   }
 
-  return NextResponse.json({ ok: true, sent, skipped, closed })
+  return NextResponse.json({ ok: true, sent, failed, skipped, closed })
 }
