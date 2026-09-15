@@ -103,6 +103,28 @@ export async function GET(request) {
       continue
     }
 
+    // MESSAGE-REDUCTION (2026-09-14): don't nudge on the very first missed
+    // day — give traders a pass for a single slip rather than messaging
+    // (and billing) every single day. From the 2nd consecutive missed day
+    // onward, reminders resume daily until they catch up, so someone who
+    // drifts further doesn't go completely silent. Day 1 of a cycle has no
+    // prior day to have "caught up" from, so it's never skipped — a
+    // brand-new trader who hasn't paid yet on day 1 still gets reminded.
+    if (cycleDayNumber > 1) {
+      const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().split('T')[0]
+      const { data: paidYesterday } = await supabase
+        .from('contributions')
+        .select('id')
+        .eq('cycle_id', cycle.id)
+        .eq('contribution_date', yesterday)
+        .single()
+
+      if (paidYesterday) {
+        skipped++
+        continue
+      }
+    }
+
     if (!cycle.users?.whatsapp_number) {
       console.error('Daily reminder: cycle missing whatsapp number', cycle.id)
       continue
