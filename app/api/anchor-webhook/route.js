@@ -78,7 +78,7 @@ async function handleKycEvent(payload) {
     await clearSession(user.whatsapp_number)
     await sendMessage(
       user.whatsapp_number,
-      `Your savings plan is now active!\n\n${user.full_name} your MyAjo journey has begun.\n\nSend your daily savings of N${parseFloat(dailyAmount).toLocaleString()} to this account:\n\nAccount Number: ${account.accountNumber}\n(This is your dedicated MyAjo savings account, held with our licensed banking partner.)\n\nWhen your transfer goes through, we will confirm it automatically. You can also type PAID anytime to check.\n\nGood luck and stay consistent!`
+      `Your savings plan is now active!\n\n${user.full_name} your MyAjo journey has begun.\n\nSend your daily savings of N${parseFloat(dailyAmount).toLocaleString()} to this account:\n\nAccount Number: ${account.accountNumber}\n(This is your dedicated MyAjo savings account, held with our licensed banking partner.)\n\nYou won't hear from Temi every single day — we'll check in with a full update on day 10 and day 20, and let you know right away if you miss more than one day in a row. Want to check your progress anytime in between? Just type BALANCE.\n\nGood luck and stay consistent!`
     )
   } else {
     // Session is gone — most likely because the trader's own poll
@@ -430,6 +430,20 @@ export async function POST(request) {
         )
       }
 
+      return new NextResponse('OK', { status: 200 })
+    }
+
+    // MESSAGE-REDUCTION (2026-09-14): confirmations used to fire on every
+    // single payment — for a reliable payer that's ~30 messages/cycle,
+    // the single biggest chunk of Meta cost once October 1 pricing lands.
+    // Now only sent on day 10 and day 20 (day 30 is already its own
+    // cycle_complete message above). The contribution itself is still
+    // recorded silently every day either way — only the notification is
+    // gated. Reuses the exact same approved template/wording as before,
+    // so no new Meta submission was needed for this change.
+    const isMilestoneDay = cycleDayNumber === 10 || cycleDayNumber === 20
+
+    if (!isMilestoneDay) {
       return new NextResponse('OK', { status: 200 })
     }
 
