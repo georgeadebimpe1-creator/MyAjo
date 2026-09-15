@@ -662,10 +662,20 @@ export async function POST(request) {
  
     const from = message.from
     const body = message.text.body
- 
+
+    // DATA-QUALITY FIX (2026-09-14): this used to send the reply to the
+    // raw, unconverted 'from' (international format, e.g. 2349128184040)
+    // while every other send path in the app — and users.whatsapp_number
+    // itself — uses the local format (09128184040) that handleMessage
+    // computes internally. That mismatch meant the same trader showed up
+    // as two separate numbers in message_log, breaking any per-trader
+    // report. Converting here too, matching handleMessage's own logic
+    // exactly, so every row for one trader uses one consistent number.
+    const whatsapp = from.startsWith('234') ? '0' + from.slice(3) : from
+
     const responseText = await handleMessage(from, body)
     if (responseText) {
-      await sendMessage(from, responseText)
+      await sendMessage(whatsapp, responseText)
     }
  
     return new NextResponse('OK', { status: 200 })
