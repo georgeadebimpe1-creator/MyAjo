@@ -1,6 +1,10 @@
 import { NextResponse } from 'next/server'
 import { supabase } from '../../lib/supabase'
-import { sendMessage } from '../../lib/whatsapp'
+import { supabaseAdmin } from '../../lib/supabase'
+import { sendMessage, downloadWhatsappMediaAsBase64 } from '../../lib/whatsapp'
+import { verifyBvnWithSelfie, applyVerifiedIdentity } from '../../lib/dojah'
+import { getUserForBankChange, checkBankChangeEligibility, recordBankChange, namesLikelyMatch, isNameMatchEnforced } from '../../lib/bankChange'
+import { sendAdminAlert } from '../../lib/alerts'
 import { getMessage, LANGUAGES, LANGUAGE_SELECT_MESSAGE } from '../../lib/messages'
 import { quoteWithdrawalForCycle, processWithdrawal } from '../../lib/withdrawal'
 import { anchorPayout } from '../../lib/payout'
@@ -166,6 +170,144 @@ function buildPlanMessage(temp, lang) {
   })
 }
 
+// ---------------------------------------------------------------------
+// CHANGEBANK — let a trader change their payout bank account.
+// Rules live in lib/bankChange.js: BVN + selfie re-check (Dojah widget,
+// result arrives at app/api/dojah-webhook/route.js), N200 fee taken at
+// the next payout, once per 30 days, 24h withdrawal pause afterwards.
+// Steps: bankchange_consent -> awaiting_bankchange_verification ->
+// bankchange_details (-> bankchange_select_bank) -> done.
+// ---------------------------------------------------------------------
+const BANKCHANGE_VERIFIED_WINDOW_MS = 30 * 60 * 1000
+
+async function finishBankChange(whatsapp, user, lang, result) {
+  try {
+    await recordBankChange(user.id, user.bank_change_fee_owed)
+  } catch (err) {
+    // The bank is already changed but the 24h hold / fee were NOT
+    // saved. That leaves a gap a hijacker could use, so tell the admin.
+    await sendAdminAlert(
+      'Bank changed but hold/fee not saved',
+      `A trader's payout bank was changed, but the 24-hour withdrawal hold and the N200 fee could not be saved.\n\nUser ID: ${user.id}\nWhatsApp: ${whatsapp}\n\nSet users.last_bank_change_at = now() and add 200 to users.bank_change_fee_owed by hand, and check the account.`
+    )
+    await clearSession(whatsapp)
+    return getMessage('bankchange_save_error', lang)
+  }
+
+  await sendAdminAlert(
+    'Trader changed payout bank account',
+    `A trader changed their payout bank account.\n\nUser ID: ${user.id}\nWhatsApp: ${whatsapp}\nOld bank: ${user.bank_name || 'unknown'}\nNew bank: ${result.bankName}\n\nWithdrawals are paused for 24 hours and a N200 fee is owed at their next payout.`
+  )
+  await clearSession(whatsapp)
+  return getMessage('bankchange_success', lang, {
+    bankName: result.bankName,
+    last4: String(result.accountNumber).slice(-4),
+  })
+}
+
+// Shared by the "typed bank name" and "picked from a list" steps.
+async function linkNewBank(whatsapp, user, lang, linkFn) {
+  const eligibility = checkBankChangeEligibility(user)
+  if (!eligibility.ok) {
+    await clearSession(whatsapp)
+    return getMessage('bankchange_error', lang)
+  }
+  return linkFn(
+    isNameMatchEnforced()
+      ? { expectedName: user.full_name, nameMatcher: namesLikelyMatch }
+      : {}
+  )
+}
+
+async function handleBankChangeStep(whatsapp, upper, message, step, temp) {
+  const lang = temp.language || getLang(temp)
+
+  if (upper === 'CANCEL' || (upper === 'NO' && step === 'bankchange_consent')) {
+    await clearSession(whatsapp)
+    return getMessage('bankchange_cancelled', lang)
+  }
+
+  if (step === 'bankchange_consent') {
+    if (upper !== 'YES') return getMessage('bankchange_intro', lang)
+    await updateSession(whatsapp, 'awaiting_bankchange_verification', { language: lang, failedChecks: 0 })
+    const verifyLink = `${APP_URL}/verify?ref=${whatsapp}`
+    return getMessage('bankchange_verify_link', lang, { verifyLink })
+  }
+
+  if (step === 'awaiting_bankchange_verification') {
+    return getMessage('bankchange_waiting', lang)
+  }
+
+  // From here on the trader has passed the identity check (set only by
+  // the Dojah webhook). Refuse if that was too long ago.
+  if (!temp.verifiedAt || Date.now() - temp.verifiedAt > BANKCHANGE_VERIFIED_WINDOW_MS) {
+    await clearSession(whatsapp)
+    return getMessage('bankchange_error', lang)
+  }
+
+  const user = await getUserForBankChange(whatsapp)
+  if (!user) {
+    await clearSession(whatsapp)
+    return getMessage('bankchange_error', lang)
+  }
+
+  if (step === 'bankchange_details') {
+    const lines = message.split('\n').map((l) => l.trim()).filter(Boolean)
+    const accountNumber = (lines[1] || '').replace(/\s/g, '')
+    if (lines.length < 2 || !/^\d{10}$/.test(accountNumber)) {
+      return getMessage('bankchange_details_invalid', lang)
+    }
+    const bankName = lines[0]
+
+    let result
+    try {
+      result = await linkNewBank(whatsapp, user, lang, (options) => verifyAndLinkBankAccount(user.id, bankName, accountNumber, options))
+    } catch (err) {
+      console.error('CHANGEBANK: bank verification failed', whatsapp, err)
+      return getMessage('bank_verify_error', lang, { err: err.message })
+    }
+    if (typeof result === 'string') return result
+
+    if (result.retype) return getMessage('bankchange_details_invalid', lang)
+    if (result.needsSelection) {
+      const numbered = result.candidates.map((c, i) => `${i + 1}. ${c.name}`).join('\n')
+      await updateSession(whatsapp, 'bankchange_select_bank', {
+        language: lang, verifiedAt: temp.verifiedAt, bankCandidates: result.candidates, accountNumber,
+      })
+      return getMessage('bank_selection', lang, { bankName, numbered })
+    }
+    if (result.nameMismatch) return getMessage('bankchange_name_mismatch', lang)
+
+    return finishBankChange(whatsapp, user, lang, { bankName: result.bankName, accountNumber })
+  }
+
+  if (step === 'bankchange_select_bank') {
+    const candidates = temp.bankCandidates || []
+    const choice = parseInt(message, 10)
+    if (isNaN(choice) || choice < 1 || choice > candidates.length) {
+      const numbered = candidates.map((c, i) => `${i + 1}. ${c.name}`).join('\n')
+      return getMessage('select_bank_invalid', lang, { numbered })
+    }
+
+    let result
+    try {
+      result = await linkNewBank(whatsapp, user, lang, (options) => verifyAndLinkResolvedBank(user.id, candidates[choice - 1], temp.accountNumber, options))
+    } catch (err) {
+      console.error('CHANGEBANK: selected bank verification failed', whatsapp, err)
+      return getMessage('select_bank_error', lang, { err: err.message })
+    }
+    if (typeof result === 'string') return result
+
+    if (result.nameMismatch) {
+      await updateSession(whatsapp, 'bankchange_details', { language: lang, verifiedAt: temp.verifiedAt })
+      return getMessage('bankchange_name_mismatch', lang)
+    }
+    return finishBankChange(whatsapp, user, lang, { bankName: result.bankName, accountNumber: temp.accountNumber })
+  }
+
+  return getMessage('fallback_not_understood', lang)
+}
+
 async function handleMessage(from, body) {
   const whatsapp = from.startsWith('234') ? '0' + from.slice(3) : from
 
@@ -197,6 +339,49 @@ async function handleMessage(from, body) {
     }
     await updateSession(whatsapp, 'main_menu', { language: lang })
     return getMessage('welcome', lang)
+  }
+
+  if (upper === 'CHANGEBANK') {
+    const user = await getUserForBankChange(whatsapp)
+    const lang = (user && user.language) || getLang(temp)
+    const eligibility = checkBankChangeEligibility(user)
+    if (!eligibility.ok) {
+      const key = { no_account: 'bankchange_no_account', frozen: 'bankchange_frozen', cooldown: 'bankchange_cooldown' }[eligibility.reason] || 'bankchange_not_set_up'
+      return getMessage(key, lang, { eligibleOn: eligibility.eligibleOn })
+    }
+    await updateSession(whatsapp, 'bankchange_consent', { language: lang, failedChecks: 0 })
+    return getMessage('bankchange_intro', lang)
+  }
+
+  if (step === 'bankchange_consent' || step === 'awaiting_bankchange_verification' || step === 'bankchange_details' || step === 'bankchange_select_bank') {
+    return handleBankChangeStep(whatsapp, upper, message, step, temp)
+  }
+
+  // MANUAL VERIFICATION (unlisted — deliberately NOT in HELP). For a
+  // trader support has already spoken to by phone who cannot complete
+  // the Dojah widget link. Collects BVN as text, then a selfie photo
+  // (handled in handleImageMessage below), and checks both directly
+  // with Dojah. Sets kyc_status to 'verified' exactly like the widget
+  // does, so the normal DONE flow takes over from there unchanged.
+  if (upper === 'MANUALVERIFY') {
+    const lang = getLang(temp)
+    await updateSession(whatsapp, 'awaiting_manual_bvn', { language: lang })
+    return getMessage('manual_verify_bvn_prompt', lang)
+  }
+
+  if (step === 'awaiting_manual_bvn') {
+    const lang = getLang(temp)
+    const bvn = message.replace(/\s/g, '')
+    if (!/^\d{11}$/.test(bvn)) {
+      return getMessage('manual_verify_bvn_invalid', lang)
+    }
+    await updateSession(whatsapp, 'awaiting_manual_selfie', { language: lang, manualBvn: bvn })
+    return getMessage('manual_verify_selfie_prompt', lang)
+  }
+
+  if (step === 'awaiting_manual_selfie') {
+    // They typed text when we're waiting for a photo.
+    return getMessage('manual_verify_selfie_prompt', getLang(temp))
   }
 
   if (upper === 'RECONNECT') {
@@ -606,11 +791,11 @@ async function handleMessage(from, body) {
  
     if (result.cycleEnded) {
       await updateSession(whatsapp, 'cycle_complete', { language: lang })
-      return getMessage('withdrawal_cycle_ended', lang, { netAmount: result.netAmount.toLocaleString() })
+      return getMessage('withdrawal_cycle_ended', lang, { netAmount: result.netAmount.toLocaleString() }) + bankFeeNote(result)
     }
  
     await clearSession(whatsapp)
-    return getMessage('withdrawal_success', lang, { netAmount: result.netAmount.toLocaleString() })
+    return getMessage('withdrawal_success', lang, { netAmount: result.netAmount.toLocaleString() }) + bankFeeNote(result)
   }
  
   if (upper === 'NO' && step === 'awaiting_withdrawal_confirmation') {
@@ -649,6 +834,55 @@ export async function GET(request) {
   return new NextResponse('Verification failed', { status: 403 })
 }
  
+// Handles an incoming photo. The ONLY place a photo is expected is the
+// manual-verification selfie step; anywhere else we say so instead of
+// silently dropping it (which is what happened before images were
+// supported at all).
+// English-only, same known gap as the quote text in lib/withdrawalLogic.js.
+function bankFeeNote(result) {
+  return result.bankChangeFee > 0
+    ? `\n\nThis includes the N${result.bankChangeFee.toLocaleString()} bank account change fee.`
+    : ''
+}
+
+async function handleImageMessage(from, image) {
+  const whatsapp = from.startsWith('234') ? '0' + from.slice(3) : from
+  await updateLastInboundAt(whatsapp)
+
+  const session = await getSession(whatsapp)
+  const step = session ? session.step : 'welcome'
+  const temp = session ? session.temp_data : {}
+  const lang = getLang(temp)
+
+  if (step !== 'awaiting_manual_selfie') {
+    return getMessage('image_not_expected', lang)
+  }
+
+  if (!temp.manualBvn) {
+    console.error('handleImageMessage: awaiting selfie but no BVN in session', whatsapp)
+    await clearSession(whatsapp)
+    return getMessage('manual_verify_restart', lang)
+  }
+
+  try {
+    const selfieBase64 = await downloadWhatsappMediaAsBase64(image.id)
+    const result = await verifyBvnWithSelfie({ bvn: temp.manualBvn, selfieImageBase64: selfieBase64 })
+
+    if (!result.matched) {
+      console.log('Manual verify: selfie did not match', whatsapp, result.entity?.selfie_verification)
+      await clearSession(whatsapp)
+      return getMessage('manual_verify_failed', lang)
+    }
+
+    await applyVerifiedIdentity(supabaseAdmin, whatsapp, result.entity)
+    await updateSession(whatsapp, 'onboarding', { language: lang })
+    return getMessage('manual_verify_success', lang)
+  } catch (err) {
+    console.error('Manual verify failed', whatsapp, err?.status, err?.dojahDetail || err)
+    return getMessage('manual_verify_error', lang)
+  }
+}
+
 export async function POST(request) {
   try {
     const payload = await request.json()
@@ -656,12 +890,12 @@ export async function POST(request) {
     const change = entry?.changes?.[0]
     const message = change?.value?.messages?.[0]
  
-    if (!message || message.type !== 'text') {
+    if (!message || (message.type !== 'text' && message.type !== 'image')) {
       return new NextResponse('OK', { status: 200 })
     }
  
     const from = message.from
-    const body = message.text.body
+    const body = message.type === 'text' ? message.text.body : null
 
     // DATA-QUALITY FIX (2026-09-14): this used to send the reply to the
     // raw, unconverted 'from' (international format, e.g. 2349128184040)
@@ -673,7 +907,9 @@ export async function POST(request) {
     // exactly, so every row for one trader uses one consistent number.
     const whatsapp = from.startsWith('234') ? '0' + from.slice(3) : from
 
-    const responseText = await handleMessage(from, body)
+    const responseText = message.type === 'image'
+      ? await handleImageMessage(from, message.image)
+      : await handleMessage(from, body)
     if (responseText) {
       await sendMessage(whatsapp, responseText)
     }
