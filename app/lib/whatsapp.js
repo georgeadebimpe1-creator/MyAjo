@@ -67,6 +67,45 @@ export function isWindowOpen(lastInboundAt) {
   return Date.now() - last < WINDOW_SAFETY_MARGIN_MS
 }
 
+// Downloads a WhatsApp-hosted media file (e.g. an incoming selfie
+// photo) and returns it as a RAW base64 string — no "data:image/..."
+// prefix, matching what Dojah's direct API expects (see lib/dojah.js).
+//
+// Two-step, per Meta's Cloud API: (1) exchange the media ID from the
+// webhook payload for a short-lived, authenticated download URL, then
+// (2) fetch that URL with the same bearer token. The URL from step 1
+// expires quickly and is NOT the media itself — skipping straight to
+// treating the ID as a URL, or reusing an old URL, both fail.
+export async function downloadWhatsappMediaAsBase64(mediaId) {
+  const metaResponse = await fetch(`https://graph.facebook.com/v20.0/${mediaId}`, {
+    headers: { 'Authorization': `Bearer ${META_TOKEN}` },
+  })
+
+  if (!metaResponse.ok) {
+    const errorBody = await metaResponse.text()
+    console.error('downloadWhatsappMediaAsBase64: media lookup failed', metaResponse.status, errorBody, { mediaId })
+    throw new Error('Could not look up that photo from WhatsApp.')
+  }
+
+  const { url } = await metaResponse.json()
+  if (!url) {
+    console.error('downloadWhatsappMediaAsBase64: no url in media lookup response', { mediaId })
+    throw new Error('Could not look up that photo from WhatsApp.')
+  }
+
+  const fileResponse = await fetch(url, {
+    headers: { 'Authorization': `Bearer ${META_TOKEN}` },
+  })
+
+  if (!fileResponse.ok) {
+    console.error('downloadWhatsappMediaAsBase64: media download failed', fileResponse.status, { mediaId })
+    throw new Error('Could not download that photo from WhatsApp.')
+  }
+
+  const arrayBuffer = await fileResponse.arrayBuffer()
+  return Buffer.from(arrayBuffer).toString('base64')
+}
+
 // Best-effort logging — never throws, never blocks the caller. A gap in
 // message_log is a reporting inconvenience; a blocked trader message
 // over a logging bug would be a much worse trade.
