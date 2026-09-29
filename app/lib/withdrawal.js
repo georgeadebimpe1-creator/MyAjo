@@ -15,6 +15,7 @@ import { supabaseAdmin } from './supabase'
 import { quoteWithdrawal } from './withdrawalLogic'
 import { sendAdminAlert } from './alerts'
 import { getCycleDayNumber } from './savings'
+import { getWithdrawalHold } from './bankChange'
 
 /**
  * Withdrawable balance = total_saved minus the locked commission minus
@@ -45,12 +46,40 @@ export async function getWithdrawableBalance(cycle) {
  * Does NOT move money.
  */
 export async function quoteWithdrawalForCycle(cycle, requestedAmount) {
+  const user = await loadBankChangeState(cycle.user_id)
+
+  // Paused for 24h after a bank change — tell the trader before they
+  // go any further, not only at the last step.
+  const hold = getWithdrawalHold(user)
+  if (hold.held) {
+    return { allowed: false, reason: hold.message }
+  }
+
   const withdrawableBalance = await getWithdrawableBalance(cycle)
   return quoteWithdrawal({
     requestedAmount,
     cycleDayNumber: getCycleDayNumber(cycle.start_date),
     withdrawableBalance,
+    bankChangeFeeOwed: user?.bank_change_fee_owed || 0,
   })
+}
+
+// The two bank-change fields on the trader's row. Returns null if the
+// lookup fails — callers treat that as "no hold, nothing owed", except
+// processWithdrawal, which refuses to continue (see below), because a
+// hold must fail CLOSED where money actually moves.
+async function loadBankChangeState(userId) {
+  const { data, error } = await supabaseAdmin
+    .from('users')
+    .select('last_bank_change_at, bank_change_fee_owed')
+    .eq('id', userId)
+    .single()
+
+  if (error) {
+    console.error('loadBankChangeState: could not read user', userId, error)
+    return null
+  }
+  return data
 }
 
 /**
@@ -72,11 +101,26 @@ export async function processWithdrawal(cycleId, requestedAmount, payoutFn) {
     return { success: false, reason: 'Cycle not found. It may have already ended.' }
   }
 
+  // Fail CLOSED: if we cannot read the bank-change state, we cannot
+  // know whether a hold applies, so no money moves. (`held: true` also
+  // stops the daily day-30 sweep raising a "failed" alert for what is
+  // really an intentional pause.)
+  const bankState = await loadBankChangeState(cycle.user_id)
+  if (!bankState) {
+    return { success: false, reason: 'We could not check your account status right now. Please try again shortly.' }
+  }
+
+  const hold = getWithdrawalHold(bankState)
+  if (hold.held) {
+    return { success: false, held: true, reason: hold.message }
+  }
+
   const withdrawableBalance = await getWithdrawableBalance(cycle)
   const freshQuote = quoteWithdrawal({
     requestedAmount,
     cycleDayNumber: getCycleDayNumber(cycle.start_date),
     withdrawableBalance,
+    bankChangeFeeOwed: bankState.bank_change_fee_owed || 0,
   })
 
   if (!freshQuote.allowed) {
@@ -84,6 +128,7 @@ export async function processWithdrawal(cycleId, requestedAmount, payoutFn) {
   }
 
   const commission = freshQuote.payoutType === 'cycle_completion' ? parseFloat(cycle.commission) : 0
+  const bankChangeFee = freshQuote.bankChangeFee || 0
 
   const { data: payout, error: insertErr } = await supabaseAdmin
     .from('payouts')
@@ -95,6 +140,7 @@ export async function processWithdrawal(cycleId, requestedAmount, payoutFn) {
       net_amount: freshQuote.netAmount,
       payout_type: freshQuote.payoutType,
       withdrawal_fee: freshQuote.fee,
+      bank_change_fee: bankChangeFee,
       fee_reason: freshQuote.feeReason,
       status: 'pending',
       initiated_at: new Date().toISOString(),
@@ -106,7 +152,11 @@ export async function processWithdrawal(cycleId, requestedAmount, payoutFn) {
     return { success: false, reason: 'Could not log this withdrawal. Please try again.' }
   }
 
-  const payoutResult = await payoutFn({ userId: cycle.user_id, amount: freshQuote.netAmount, commission })
+  // The bank change fee is swept to MyAjo the same way commission is
+  // (a book transfer out of the trader's account just before the bank
+  // payout), so it is added to the `commission` argument here. The
+  // payouts.commission column above still records commission only.
+  const payoutResult = await payoutFn({ userId: cycle.user_id, amount: freshQuote.netAmount, commission: commission + bankChangeFee })
 
   if (!payoutResult.success) {
     const { error: failUpdateErr } = await supabaseAdmin
@@ -118,6 +168,25 @@ export async function processWithdrawal(cycleId, requestedAmount, payoutFn) {
       console.error('processWithdrawal: could not mark payout failed', payout.id, failUpdateErr)
     }
     return { success: false, reason: 'The payout could not be completed. Please try again shortly, or contact support.' }
+  }
+
+  // Money has moved and the fee was taken — clear it from what is owed.
+  // If this write fails the trader would be charged again next payout,
+  // so alert loudly for manual correction.
+  if (bankChangeFee > 0) {
+    const remainingOwed = Math.max(0, parseFloat(bankState.bank_change_fee_owed || 0) - bankChangeFee)
+    const { error: feeClearErr } = await supabaseAdmin
+      .from('users')
+      .update({ bank_change_fee_owed: remainingOwed })
+      .eq('id', cycle.user_id)
+
+    if (feeClearErr) {
+      console.error('processWithdrawal: PAYOUT SUCCEEDED but bank change fee owed was not cleared', { userId: cycle.user_id, payoutId: payout.id, error: feeClearErr })
+      await sendAdminAlert(
+        'Bank change fee not cleared after payout',
+        `A payout deducted a N${bankChangeFee} bank change fee, but the trader's "fee owed" could not be reduced.\n\nUser ID: ${cycle.user_id}\nPayout ID: ${payout.id}\nShould now be owed: N${remainingOwed}\nSupabase error: ${feeClearErr.message || JSON.stringify(feeClearErr)}\n\nFix users.bank_change_fee_owed by hand, or they will be charged the fee again at their next payout.`
+      )
+    }
   }
 
   const cycleEnding =
@@ -186,6 +255,7 @@ export async function processWithdrawal(cycleId, requestedAmount, payoutFn) {
     success: true,
     netAmount: freshQuote.netAmount,
     fee: freshQuote.fee,
+    bankChangeFee,
     cycleEnded: cycleEnding,
   }
 }
