@@ -141,7 +141,7 @@ export async function freezeAccount(userId) {
 //   { verified: true, accountName, bankName }
 //   { needsSelection: true, candidates: [{ code, name }, ...] }
 //   { retype: true }   — nothing close matched at all
-export async function verifyAndLinkBankAccount(userId, typedBankName, accountNumber) {
+export async function verifyAndLinkBankAccount(userId, typedBankName, accountNumber, options = {}) {
   const resolved = await resolveBankFromName(typedBankName)
 
   if (!resolved.match) {
@@ -151,13 +151,19 @@ export async function verifyAndLinkBankAccount(userId, typedBankName, accountNum
     return { needsSelection: true, candidates: resolved.candidates }
   }
 
-  return await verifyAndLinkResolvedBank(userId, resolved.match, accountNumber)
+  return await verifyAndLinkResolvedBank(userId, resolved.match, accountNumber, options)
 }
 
 // Second half of the flow — called directly once a bankCode is already
 // known, either because resolveBankFromName found a confident single
 // match, or because the trader picked one from a numbered list.
-export async function verifyAndLinkResolvedBank(userId, bank, accountNumber) {
+//
+// `options.expectedName` (used by CHANGEBANK): if given, the bank's own
+// account name must look like this name, or nothing is saved and
+// { nameMismatch: true } is returned. Checked BEFORE the counterparty
+// is created or anything is written, so a rejected account leaves the
+// trader's existing bank untouched.
+export async function verifyAndLinkResolvedBank(userId, bank, accountNumber, options = {}) {
   let verified
   try {
     verified = await verifyAccountNumber(bank.code, accountNumber)
@@ -166,6 +172,12 @@ export async function verifyAndLinkResolvedBank(userId, bank, accountNumber) {
     throw new Error(
       "we couldn't verify that account number with the bank — please double check the number and try again"
     )
+  }
+
+  if (options.expectedName && typeof options.nameMatcher === 'function') {
+    if (!options.nameMatcher(options.expectedName, verified.accountName)) {
+      return { nameMismatch: true, accountName: verified.accountName }
+    }
   }
 
   let counterParty
