@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { supabase } from '../../lib/supabase'
-import { sendMessage, sendProactiveMessage } from '../../lib/whatsapp'
+import { sendMessage, sendProactiveMessage, isWindowOpen } from '../../lib/whatsapp'
 import { getMessage } from '../../lib/messages'
 import { getCycleDayNumber } from '../../lib/savings'
 import { getWithdrawableBalance, processWithdrawal } from '../../lib/withdrawal'
@@ -73,6 +73,22 @@ export async function GET(request) {
           }],
         })
 
+        // Bank change fee breakdown. The approved cycle-complete template
+        // only has three figures (saved / commission / net), so the fee
+        // line goes as a free-form follow-up, which WhatsApp only allows
+        // inside the 24-hour window. Outside it the trader is not sent
+        // the breakdown (a new Meta-approved template is needed for that).
+        if (completeResult?.ok && result.bankChangeFee > 0) {
+          if (isWindowOpen(cycle.users.last_inbound_at)) {
+            await sendMessage(
+              cycle.users.whatsapp_number,
+              `Here is the breakdown of what was deducted from your savings:\n\nTotal saved: N${parseFloat(cycle.total_saved).toLocaleString()}\nCommission: N${parseFloat(cycle.commission).toLocaleString()}\nBank account change fee: N${result.bankChangeFee.toLocaleString()}\nSent to your bank: N${result.netAmount.toLocaleString()}`
+            )
+          } else {
+            console.log('Daily reminder: bank change fee deducted but breakdown not sent (24h window closed)', { cycleId: cycle.id, fee: result.bankChangeFee })
+          }
+        }
+
         // A real payout just went out — if the trader can't be told,
         // that's a support/trust problem waiting to happen (they'll see
         // money land with no explanation), worth a direct alert rather
@@ -80,11 +96,20 @@ export async function GET(request) {
         if (!completeResult?.ok) {
           console.error('Daily reminder: day-30 payout succeeded but notification failed', { cycleId: cycle.id, whatsapp: cycle.users.whatsapp_number })
           await sendAdminAlert(
-            `Payout succeeded but trader could not be notified.\n\nCycle ID: ${cycle.id}\nWhatsApp: ${cycle.users.whatsapp_number}\nNet payout: N${result.netAmount.toLocaleString()}\n\nTheir money has been sent, but they don't know it yet — worth reaching out directly.`
+            'Payout succeeded but trader could not be notified',
+            `Cycle ID: ${cycle.id}\nWhatsApp: ${cycle.users.whatsapp_number}\nNet payout: N${result.netAmount.toLocaleString()}\n\nTheir money has been sent, but they don't know it yet — worth reaching out directly.`
           )
         }
+      } else if (!result.success && result.held) {
+        // Intentional pause after a bank change — not a failure. The
+        // cycle stays active and is picked up again by tomorrow's run.
+        console.log('Daily reminder: day-30 payout waiting on bank change hold', { cycleId: cycle.id })
       } else if (!result.success) {
         console.error('Daily reminder: day-30 auto-close failed, needs manual reconciliation', { cycleId: cycle.id, reason: result.reason })
+        await sendAdminAlert(
+          'Day-30 auto-close FAILED',
+          `Cycle ID: ${cycle.id}\nUser ID: ${cycle.user_id}\nWhatsApp: ${cycle.users?.whatsapp_number || 'unknown'}\nReason: ${result.reason || 'unknown'}\n\nThis cycle reached day 30 but its payout did not go through. It is still active and will be retried tomorrow, but it needs a look before then if possible.`
+        )
       }
 
       closed++
