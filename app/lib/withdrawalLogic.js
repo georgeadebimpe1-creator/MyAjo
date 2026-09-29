@@ -14,6 +14,11 @@
 //    absorbs Anchor's real fee out of the locked commission.
 // 5. A withdrawal that empties the withdrawable balance behaves like a
 //    full withdrawal — cycle ends.
+// 6. BANK CHANGE FEE: if the trader changed their payout bank (CHANGEBANK),
+//    a N200 fee is owed (users.bank_change_fee_owed). It is taken from
+//    the NEXT payout, on top of any other fee, and shown in the quote.
+//    If the payout is smaller than what is owed, only what fits is taken
+//    and the rest stays owed for the following payout.
 
 export const MIN_DAYS_BEFORE_WITHDRAWAL = 10
 export const CYCLE_DAYS = 30 // matches the hardcoded 30 used throughout route.js
@@ -66,7 +71,7 @@ export function calculateWithdrawalFee({ requestedAmount, cycleDayNumber, withdr
  * Full pre-check. This is what gets shown to the trader BEFORE anything is
  * deducted — she must see this and reply YES before money moves.
  */
-export function quoteWithdrawal({ requestedAmount, cycleDayNumber, withdrawableBalance }) {
+export function quoteWithdrawal({ requestedAmount, cycleDayNumber, withdrawableBalance, bankChangeFeeOwed = 0 }) {
   if (!isWithdrawalUnlocked(cycleDayNumber)) {
     return {
       allowed: false,
@@ -91,18 +96,36 @@ export function quoteWithdrawal({ requestedAmount, cycleDayNumber, withdrawableB
     withdrawableBalance,
   })
 
-  const netAmount = requestedAmount - fee
+  const netBeforeBankFee = requestedAmount - fee
+  const bankChangeFee = Math.max(0, Math.min(parseFloat(bankChangeFeeOwed) || 0, netBeforeBankFee))
+  const netAmount = netBeforeBankFee - bankChangeFee
+
+  if (netAmount <= 0) {
+    return {
+      allowed: false,
+      reason: 'That amount is too small to cover the withdrawal charges. Please request a larger amount.',
+    }
+  }
+
+  let confirmationMessage
+  if (fee === 0 && bankChangeFee === 0) {
+    confirmationMessage = `You will receive N${netAmount.toLocaleString()} in full. No charges, since you completed your full cycle.\n\nReply YES to confirm or NO to cancel.`
+  } else if (fee === 0) {
+    confirmationMessage = `You will receive N${netAmount.toLocaleString()} after the N${bankChangeFee.toLocaleString()} bank account change fee. No other charges, since you completed your full cycle.\n\nReply YES to confirm or NO to cancel.`
+  } else if (bankChangeFee === 0) {
+    confirmationMessage = `You will receive N${netAmount.toLocaleString()} after a N${fee.toLocaleString()} charge (${feeReason})\n\nReply YES to confirm or NO to cancel.`
+  } else {
+    confirmationMessage = `You will receive N${netAmount.toLocaleString()} after a N${fee.toLocaleString()} charge (${feeReason}) and the N${bankChangeFee.toLocaleString()} bank account change fee.\n\nReply YES to confirm or NO to cancel.`
+  }
 
   return {
     allowed: true,
     requestedAmount,
     fee,
     feeReason,
+    bankChangeFee,
     netAmount,
     payoutType,
-    confirmationMessage:
-      fee === 0
-        ? `You will receive N${netAmount.toLocaleString()} in full. No charges, since you completed your full cycle.`
-        : `You will receive N${netAmount.toLocaleString()} after a N${fee.toLocaleString()} charge (${feeReason})\n\nReply YES to confirm or NO to cancel.`,
+    confirmationMessage,
   }
 }
