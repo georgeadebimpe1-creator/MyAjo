@@ -413,11 +413,143 @@ const STILL_CHECKING_VERIFICATION = {
   yo: `A si n ṣayẹwo ijẹrisi rẹ, eyi maa n gba akoko diẹ. Jọwọ tẹ DONE lẹẹkansi ni iṣẹju kan.`,
 }
 
+// MANUAL VERIFICATION — English only for now, same known gap as the
+// withdrawal messages below. This path is for a trader support has
+// already spoken to by phone and is walking through this manually —
+// it is NOT advertised in HELP, and should only be started at
+// support's direction, not self-served by a trader who just can't be
+// bothered with the normal link.
+const MANUAL_VERIFY_BVN_PROMPT = {
+  en: `Okay — let's verify you manually. Please reply with your 11-digit BVN.`,
+}
+
+const MANUAL_VERIFY_BVN_INVALID = {
+  en: `That doesn't look like a valid BVN — it should be exactly 11 digits, numbers only. Please try again.`,
+}
+
+const MANUAL_VERIFY_SELFIE_PROMPT = {
+  en: `Got it. Now please send a clear selfie photo of your face — not a document or screenshot, just you, well lit, looking directly at the camera.`,
+}
+
+const MANUAL_VERIFY_SUCCESS = {
+  en: `You're verified! Now please reply with your details, one per line:
+
+Full Name
+Email Address
+Residential Address (Street, City, State)
+Bank Name
+Account Number
+
+Then type DONE.`,
+}
+
+const MANUAL_VERIFY_FAILED = {
+  en: `We couldn't match your selfie to that BVN. This usually means the photo wasn't clear enough, or the BVN doesn't match. Please contact support at hello@myajo.com.ng to try again.`,
+}
+
+const MANUAL_VERIFY_ERROR = {
+  en: `Something went wrong on our end verifying that. Please contact support at hello@myajo.com.ng and we'll sort it out.`,
+}
+
+const MANUAL_VERIFY_RESTART = {
+  en: `Something went wrong with your verification session. Please type MENU to start over, or contact support at hello@myajo.com.ng.`,
+}
+
+const IMAGE_NOT_EXPECTED = {
+  en: `Thanks for the photo, but I wasn't expecting one right now. Type MENU if you'd like to start over, or HELP for a list of commands.`,
+}
+
 const BANK_VERIFY_ERROR = {
   en: ({ err }) => `We hit a snag verifying your bank details (${err}). Please type DONE again in a moment, or type EDIT to re-enter your details.`,
   ha: ({ err }) => `Mun ci karo da matsala wajen tabbatar da bayanan bankinku (${err}). Da fatan za a sake rubuta DONE bayan ɗan lokaci, ko rubuta EDIT domin sake shigar da bayanai.`,
   ig: ({ err }) => `Anyị enwetara nsogbu na ịkwado nkọwa ụlọ akụ gị (${err}). Biko pịnye DONE ọzọ mgbe obere oge gachara, ma ọ bụ pịnye EDIT iji tinye nkọwa gị ọzọ.`,
   yo: ({ err }) => `A ba ni iṣoro ni jẹrisi awọn alaye banki rẹ (${err}). Jọwọ tẹ DONE lẹẹkansi laipẹ, tabi tẹ EDIT lati tun awọn alaye rẹ tẹ.`,
+}
+
+// CHANGEBANK (change payout bank account) — English only for now, same
+// known gap as the withdrawal and manual-verification messages. The
+// fee/hold/limit numbers here must match lib/bankChange.js.
+const BANKCHANGE_INTRO = {
+  en: `You can change the bank account we pay your savings into.
+
+Before you start, please note:
+- You will verify your identity again (BVN and a live selfie).
+- A N200 fee applies. It is not charged now. It will be deducted from your next payout, together with our usual charges.
+- For your security, withdrawals are paused for 24 hours after the change.
+- You can change your bank once every 30 days.
+
+Reply YES to continue or NO to cancel.`,
+}
+
+const BANKCHANGE_NO_ACCOUNT = {
+  en: `I could not find your MyAjo account on this number. If you changed your number, type RECONNECT first.`,
+}
+
+const BANKCHANGE_NOT_SET_UP = {
+  en: `Your account is not fully set up yet, so there is no payout bank to change. Please finish signing up first, or contact support at hello@myajo.com.ng.`,
+}
+
+const BANKCHANGE_FROZEN = {
+  en: `Your account is frozen, so it cannot be changed right now. Please contact support at hello@myajo.com.ng or 08029708278.`,
+}
+
+const BANKCHANGE_COOLDOWN = {
+  en: ({ eligibleOn }) => `You changed your bank account recently. For your security you can change it once every 30 days. You can change it again on ${eligibleOn}. If it is urgent, please contact support at hello@myajo.com.ng.`,
+}
+
+const BANKCHANGE_VERIFY_LINK = {
+  en: ({ verifyLink }) => `Please verify your identity here:\n${verifyLink}\n\nComplete the steps on that page. I will message you here as soon as it is done. Type CANCEL to stop.`,
+}
+
+const BANKCHANGE_WAITING = {
+  en: `I am still waiting for your identity check. Please complete the link I sent you, or type CANCEL to stop.`,
+}
+
+const BANKCHANGE_VERIFIED = {
+  en: `Identity confirmed. Now send your NEW bank details on two lines:
+
+Bank Name
+Account Number
+
+Type CANCEL to stop.`,
+}
+
+const BANKCHANGE_VERIFY_FAILED = {
+  en: ({ attemptsLeft }) => `We could not confirm your identity. Please try the link again. You have ${attemptsLeft} attempt${attemptsLeft === 1 ? '' : 's'} left.`,
+}
+
+const BANKCHANGE_TOO_MANY = {
+  en: `We could not confirm your identity after several tries, so this has been stopped for your security. Please contact support at hello@myajo.com.ng or 08029708278.`,
+}
+
+const BANKCHANGE_DETAILS_INVALID = {
+  en: `Please send your bank name on the first line and your 10-digit account number on the second line. Type CANCEL to stop.`,
+}
+
+const BANKCHANGE_NAME_MISMATCH = {
+  en: `The name on that bank account does not match the name on your MyAjo account. For your security, we can only pay out to an account in your own name. Please send the details of an account in your name, or type CANCEL to stop.`,
+}
+
+const BANKCHANGE_SUCCESS = {
+  en: ({ bankName, last4 }) => `Done. Your payout account is now ${bankName}, ending ${last4}.
+
+Please note:
+- Withdrawals are paused for 24 hours.
+- The N200 change fee will be deducted from your next payout.
+
+If you did not make this change, contact support immediately at hello@myajo.com.ng or 08029708278.`,
+}
+
+const BANKCHANGE_CANCELLED = {
+  en: `Okay, your bank account has not been changed.`,
+}
+
+const BANKCHANGE_ERROR = {
+  en: `Something went wrong on our end. Your bank account has not been changed. Please try again shortly, or contact support at hello@myajo.com.ng.`,
+}
+
+const BANKCHANGE_SAVE_ERROR = {
+  en: `Your bank account was updated, but we hit a problem finishing the change. Please contact support right away at hello@myajo.com.ng or 08029708278.`,
 }
 
 const BANK_NOT_FOUND = {
@@ -1138,6 +1270,30 @@ export function getMessage(key, lang, params = {}) {
   if (key === 'onboarding_details_missing') return pick(ONBOARDING_DETAILS_MISSING)
   if (key === 'verification_failed') return pick(VERIFICATION_FAILED)
   if (key === 'still_checking_verification') return pick(STILL_CHECKING_VERIFICATION)
+  if (key === 'manual_verify_bvn_prompt') return pick(MANUAL_VERIFY_BVN_PROMPT)
+  if (key === 'manual_verify_bvn_invalid') return pick(MANUAL_VERIFY_BVN_INVALID)
+  if (key === 'manual_verify_selfie_prompt') return pick(MANUAL_VERIFY_SELFIE_PROMPT)
+  if (key === 'manual_verify_success') return pick(MANUAL_VERIFY_SUCCESS)
+  if (key === 'manual_verify_failed') return pick(MANUAL_VERIFY_FAILED)
+  if (key === 'manual_verify_error') return pick(MANUAL_VERIFY_ERROR)
+  if (key === 'manual_verify_restart') return pick(MANUAL_VERIFY_RESTART)
+  if (key === 'image_not_expected') return pick(IMAGE_NOT_EXPECTED)
+  if (key === 'bankchange_intro') return pick(BANKCHANGE_INTRO)
+  if (key === 'bankchange_no_account') return pick(BANKCHANGE_NO_ACCOUNT)
+  if (key === 'bankchange_not_set_up') return pick(BANKCHANGE_NOT_SET_UP)
+  if (key === 'bankchange_frozen') return pick(BANKCHANGE_FROZEN)
+  if (key === 'bankchange_cooldown') return BANKCHANGE_COOLDOWN.en(params)
+  if (key === 'bankchange_verify_link') return BANKCHANGE_VERIFY_LINK.en(params)
+  if (key === 'bankchange_waiting') return pick(BANKCHANGE_WAITING)
+  if (key === 'bankchange_verified') return pick(BANKCHANGE_VERIFIED)
+  if (key === 'bankchange_verify_failed') return BANKCHANGE_VERIFY_FAILED.en(params)
+  if (key === 'bankchange_too_many') return pick(BANKCHANGE_TOO_MANY)
+  if (key === 'bankchange_details_invalid') return pick(BANKCHANGE_DETAILS_INVALID)
+  if (key === 'bankchange_name_mismatch') return pick(BANKCHANGE_NAME_MISMATCH)
+  if (key === 'bankchange_success') return BANKCHANGE_SUCCESS.en(params)
+  if (key === 'bankchange_cancelled') return pick(BANKCHANGE_CANCELLED)
+  if (key === 'bankchange_error') return pick(BANKCHANGE_ERROR)
+  if (key === 'bankchange_save_error') return pick(BANKCHANGE_SAVE_ERROR)
   if (key === 'bank_verify_error') return pick(BANK_VERIFY_ERROR)
   if (key === 'bank_not_found') return pick(BANK_NOT_FOUND)
   if (key === 'bank_selection') return pick(BANK_SELECTION)
