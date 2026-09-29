@@ -1,8 +1,11 @@
 import { NextResponse } from 'next/server'
 import { supabaseAdmin } from '../../lib/supabase'
 import { sendMessage } from '../../lib/whatsapp'
-import { updateSession, clearSession } from '../../lib/session'
+import { updateSession, clearSession, getSession } from '../../lib/session'
 import { getActiveCycle, getBalanceSummary } from '../../lib/savings'
+import { applyVerifiedIdentity } from '../../lib/dojah'
+import { getUserForBankChange, BANK_CHANGE_MAX_FAILED_CHECKS } from '../../lib/bankChange'
+import { getMessage } from '../../lib/messages'
 // Dojah calls this automatically once verification is complete.
 // This is the trustworthy source of truth — not the widget's onSuccess
 // in the browser, which only tells the TRADER it succeeded, not us.
@@ -43,12 +46,39 @@ export async function POST(request) {
     const bvnEntityContainer = payload?.data?.government_data?.data
     const entity = bvnEntityContainer ? Object.values(bvnEntityContainer)[0]?.entity : null
 
-    if (verified && entity) {
-      const fullName =
-        entity.first_name && entity.last_name
-          ? `${entity.first_name} ${entity.last_name}`.trim()
-          : entity.first_name || entity.last_name || null
+    // CHANGEBANK: a trader who asked to change their payout bank is
+    // re-verifying with the same widget. This result must NEVER go
+    // through the normal path below: that path rewrites the trader's
+    // identity row and, on a failed check, marks them kyc 'failed'
+    // (which would lock a good, already-verified trader out). Here we
+    // only compare the BVN to the one already on file and move the
+    // conversation along.
+    const session = await getSession(whatsapp)
+    if (session?.step === 'awaiting_bankchange_verification') {
+      const temp = session.temp_data || {}
+      const lang = temp.language || 'en'
+      const user = await getUserForBankChange(whatsapp)
+      const bvnMatches = !!(verified && entity?.bvn && user?.bvn && String(entity.bvn) === String(user.bvn))
 
+      if (bvnMatches) {
+        await updateSession(whatsapp, 'bankchange_details', { language: lang, verifiedAt: Date.now() })
+        await sendMessage(whatsapp, getMessage('bankchange_verified', lang))
+        return new NextResponse('OK', { status: 200 })
+      }
+
+      const failedChecks = (temp.failedChecks || 0) + 1
+      console.log('Dojah webhook: CHANGEBANK identity check did not pass', whatsapp, { verified, hadBvn: !!entity?.bvn, failedChecks })
+      if (failedChecks >= BANK_CHANGE_MAX_FAILED_CHECKS) {
+        await clearSession(whatsapp)
+        await sendMessage(whatsapp, getMessage('bankchange_too_many', lang))
+      } else {
+        await updateSession(whatsapp, 'awaiting_bankchange_verification', { ...temp, failedChecks })
+        await sendMessage(whatsapp, getMessage('bankchange_verify_failed', lang, { attemptsLeft: BANK_CHANGE_MAX_FAILED_CHECKS - failedChecks }))
+      }
+      return new NextResponse('OK', { status: 200 })
+    }
+
+    if (verified && entity) {
       // FIX 4 (NEW): the BVN itself was never being saved, even though
       // the `users.bvn` column exists — nothing wrote to it. This is
       // required before an Anchor customer/deposit account can be
@@ -58,62 +88,26 @@ export async function POST(request) {
       // it in production. If it's actually the key of `data` itself
       // (e.g. Object.keys(bvnEntityContainer)[0]) rather than a field
       // inside `entity`, this needs a one-line adjustment.
-      const bvn = entity.bvn || null
-
-      // A trader who changed their WhatsApp number (lost phone, SIM
-      // swap, new line) shows up here looking exactly like a brand-new
-      // signup — a whatsapp_number Temi has never seen before. Without
-      // this check, the upsert below (keyed on whatsapp_number) would
-      // create a SECOND users row for the same real person, completely
-      // disconnected from their original row — which is what still
-      // holds their actual cycle, contribution history, and Anchor
-      // account. Their real savings would still exist, just invisible
-      // to them under the new number. This checks BVN first: if it
-      // already belongs to a different row, that's the same trader,
-      // and the fix is to update THAT row's whatsapp_number, not to
-      // create a new identity.
-      let targetUserId = null
-      if (bvn) {
-        const { data: existingByBvn, error: bvnLookupErr } = await supabaseAdmin
-          .from('users')
-          .select('id, whatsapp_number')
-          .eq('bvn', bvn)
-          .neq('whatsapp_number', whatsapp)
-          .maybeSingle()
-
-        if (bvnLookupErr) {
-          console.error('Dojah webhook: BVN lookup failed, falling back to whatsapp_number upsert — a duplicate row is possible, check manually', whatsapp, bvnLookupErr)
-        } else if (existingByBvn) {
-          targetUserId = existingByBvn.id
+      //
+      // REFACTORED: the actual Supabase write (including the
+      // BVN-migration check for a trader who changed WhatsApp numbers)
+      // now lives in lib/dojah.js's applyVerifiedIdentity(), shared
+      // with the MANUALVERIFY path in app/api/webhook/route.js, so the
+      // two paths can't quietly drift apart on what "verified" means.
+      let targetUserId, fullName
+      try {
+        const result = await applyVerifiedIdentity(supabaseAdmin, whatsapp, entity)
+        targetUserId = result.targetUserId
+        fullName = result.fullName
+        if (result.migratedFromWhatsapp) {
           console.log('Dojah webhook: BVN matched an existing trader under a different WhatsApp number — migrating their identity to the new number instead of creating a new row', {
-            oldWhatsapp: existingByBvn.whatsapp_number,
+            oldWhatsapp: result.migratedFromWhatsapp,
             newWhatsapp: whatsapp,
             userId: targetUserId,
           })
         }
-      }
-
-      const verifiedFields = {
-        whatsapp_number: whatsapp,
-        phone_number: whatsapp,
-        kyc_status: 'verified',
-        full_name: fullName,
-        date_of_birth: entity.date_of_birth || null,
-        gender: entity.gender || null,
-        residential_address: entity.residential_address || null,
-        bvn: bvn,
-      }
-
-      // FIX 3: check the Supabase response for an error instead of
-      // discarding it. Supabase does NOT throw on RLS-blocked writes —
-      // it returns { error }, which the old code never inspected, so a
-      // blocked write silently looked identical to a successful one.
-      const { error } = targetUserId
-        ? await supabaseAdmin.from('users').update(verifiedFields).eq('id', targetUserId)
-        : await supabaseAdmin.from('users').upsert(verifiedFields, { onConflict: 'whatsapp_number' })
-
-      if (error) {
-        console.error('Dojah webhook: Supabase upsert failed (verified)', whatsapp, error)
+      } catch (writeErr) {
+        console.error('Dojah webhook: applyVerifiedIdentity failed', whatsapp, writeErr)
         return new NextResponse('Error', { status: 500 })
       }
 
@@ -134,13 +128,13 @@ export async function POST(request) {
             await clearSession(whatsapp)
             await sendMessage(
               whatsapp,
-              `Welcome back${fullName ? `, ${fullName}` : ''}! We've reconnected your MyAjo account to this number.\n\nYou have an active savings cycle running — Day ${s.cycleDayNumber} of 30, N${s.totalSaved.toLocaleString()} saved so far.\n\nType BALANCE anytime to check your progress, PAID to confirm today's transfer, or WITHDRAW followed by an amount.`
+              `Welcome back${fullName ? `, ${fullName}` : ''}! We've reconnected your MyAjo account to this number.\n\nYou have an active savings cycle running — Day ${s.cycleDayNumber} of 30, N${s.totalSaved.toLocaleString()} saved so far.\n\nType BALANCE anytime to check your progress, PAID to confirm today's transfer, or WITHDRAW followed by an amount.\n\nYour payout bank account stays exactly as it was first set up, so anything bank-related you typed just now was not used. To change your bank account, contact support at hello@myajo.com.ng.`
             )
           } else {
             await updateSession(whatsapp, 'new_cycle_amount', {})
             await sendMessage(
               whatsapp,
-              `Welcome back${fullName ? `, ${fullName}` : ''}! We've reconnected your MyAjo account to this number.\n\nReady to start a new 30-day savings cycle. How much would you like to save daily this time? (N1,000 - N10,000)`
+              `Welcome back${fullName ? `, ${fullName}` : ''}! We've reconnected your MyAjo account to this number.\n\nReady to start a new 30-day savings cycle. How much would you like to save daily this time? (N1,000 - N10,000)\n\nYour payout bank account stays exactly as it was first set up, so anything bank-related you typed just now was not used. To change your bank account, contact support at hello@myajo.com.ng.`
             )
           }
         } catch (reconnectMsgErr) {
@@ -151,13 +145,6 @@ export async function POST(request) {
           // notification failure when the actual data write succeeded.
           console.error('Dojah webhook: reconnect succeeded but the welcome-back message failed', whatsapp, targetUserId, reconnectMsgErr)
         }
-      }
-
-      if (!bvn) {
-        // Don't fail the webhook over this — verification still succeeded
-        // and the trader shouldn't be stuck — but this needs eyes on it,
-        // since Anchor provisioning will fail without a BVN on file.
-        console.error('Dojah webhook: verified but no BVN captured — check payload shape', whatsapp)
       }
     } else {
       const { error } = await supabaseAdmin
