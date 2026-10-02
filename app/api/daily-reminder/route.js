@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
 import { supabase } from '../../lib/supabase'
+import { supabaseAdmin } from '../../lib/supabase'
 import { sendMessage, sendProactiveMessage, isWindowOpen } from '../../lib/whatsapp'
 import { getMessage } from '../../lib/messages'
 import { getCycleDayNumber } from '../../lib/savings'
@@ -32,6 +33,7 @@ export async function GET(request) {
   let failed = 0
   let skipped = 0
   let closed = 0
+  let abandoned = 0
 
   for (const cycle of cycles || []) {
     // FIXED 30-CALENDAR-DAY CYCLE: the webhook closes a cycle the moment
@@ -50,6 +52,31 @@ export async function GET(request) {
       }
 
       const withdrawableBalance = await getWithdrawableBalance(cycle)
+
+      // ABANDONED CYCLE: nothing was ever saved (or everything already
+      // withdrawn before day 30). This is not a failure — there is
+      // nothing to pay out and nothing to reconcile — so close it
+      // quietly instead of attempting a N0 payout, which fails
+      // validation and would otherwise re-alert every single day this
+      // sweep runs, forever, for a cycle that was likely abandoned or
+      // was test data. No trader message either: a trader who saved
+      // nothing has nothing to be told about.
+      if (withdrawableBalance <= 0) {
+        const { error: closeErr } = await supabaseAdmin
+          .from('cycles')
+          .update({ status: 'abandoned' })
+          .eq('id', cycle.id)
+
+        if (closeErr) {
+          console.error('Daily reminder: could not close empty cycle', { cycleId: cycle.id, error: closeErr })
+        } else {
+          console.log('Daily reminder: closed an empty cycle at day 30+ (nothing was ever saved)', { cycleId: cycle.id })
+          abandoned++
+        }
+        closed++
+        continue
+      }
+
       const result = await processWithdrawal(cycle.id, withdrawableBalance, anchorPayout)
 
       if (result.success && cycle.users?.whatsapp_number) {
@@ -190,5 +217,5 @@ export async function GET(request) {
     }
   }
 
-  return NextResponse.json({ ok: true, sent, failed, skipped, closed })
+  return NextResponse.json({ ok: true, sent, failed, skipped, closed, abandoned })
 }
