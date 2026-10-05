@@ -40,6 +40,21 @@ const WINDOW_SAFETY_MARGIN_MS = 23 * 60 * 60 * 1000
 // Placeholder names — replace with whatever Meta actually approves.
 // Language suffix pattern assumed (e.g. _en, _ha) to match the existing
 // per-language content in lib/messages.js once these are translated.
+//
+// Hausa first-draft content now exists in lib/messages.js (2026-09-28)
+// but is NOT reviewed and has NOT been submitted to Meta — deliberately
+// not adding a 'ha' entry here yet. Without one, TEMPLATE_NAMES safely
+// falls back to the English template for a Hausa trader on a closed
+// window, which is correct given no approved Hausa template exists.
+// Adding a 'ha' entry pointing at a template Meta hasn't approved would
+// make the closed-window case fail outright instead of falling back —
+// a regression, not progress. Once Hausa content is reviewed and
+// actually submitted/approved (same process as the English templates),
+// add 'ha' here AND to META_LOCALE_CODES below together. Yoruba and
+// Igbo templates aren't possible at all — not supported by Meta's
+// template system (confirmed against Meta's own supported-languages
+// list, 2026-09-28) — so those languages only ever reach a trader via
+// the free-form text path, never the template fallback.
 export const TEMPLATE_NAMES = {
   daily_reminder: { en: 'myajo_daily_reminder_en' },
   contribution_recorded: { en: 'myajo_contribution_recorded_en' },
