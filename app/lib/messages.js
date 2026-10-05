@@ -1199,8 +1199,25 @@ const FALLBACK_NOT_UNDERSTOOD = {
 }
 
 // ── PHASE 1B: payment notifications ─────────────────────────────────
-// English only. One compact message each, replacing what used to be
-// three or four separate lines sent as separate messages.
+// Hausa, Yoruba, Igbo added 2026-09-28 — FIRST DRAFTS, machine-translated,
+// NOT yet native-speaker reviewed. Same confidence tier as the rest of
+// this file's Phase 2 content: do not treat as verified. Terminology
+// (owo iṣẹ MyAjo / kuɗin caji dawainiyar MyAjo / ụgwọ ọrụ MyAjo for
+// "commission", etc.) was matched against the existing reviewed/drafted
+// content above for consistency, not invented fresh. Command words
+// (PAID, YES) deliberately left untranslated, matching the convention
+// used everywhere else in this file.
+//
+// PLATFORM LIMITATION: Meta's WhatsApp template system does not support
+// Yoruba or Igbo as a template language at all (confirmed against Meta's
+// own supported-languages list, 2026-09-28) — only Hausa ('ha') and
+// English are submittable as approved templates among these four. So
+// Yoruba/Igbo versions below only ever reach a trader via the free-form
+// text path (window open); on a closed window, TEMPLATE_NAMES in
+// lib/whatsapp.js falls back to the English template, by design, since
+// there is no Yoruba/Igbo template Meta will approve. Hausa's template
+// equivalents (once submitted and approved) are the one case that gets
+// full closed-window coverage in a trader's own language.
 
 const CONTRIBUTION_RECORDED = {
   en: ({ amount, dayNumber, totalSaved, daysRemaining }) =>
@@ -1216,6 +1233,45 @@ Total Saved:
 ${daysRemaining} days remaining.
 
 See you tomorrow.`,
+  ha: ({ amount, dayNumber, totalSaved, daysRemaining }) =>
+`✅ *An Karɓi Kuɗi*
+
+An karɓi ₦${amount} cikin nasara.
+
+🔥 Rana ${dayNumber} cikin 30
+
+Jimlar da aka Ajiye:
+₦${totalSaved}
+
+Kwana ${daysRemaining} sun rage.
+
+Sai gobe.`,
+  yo: ({ amount, dayNumber, totalSaved, daysRemaining }) =>
+`✅ *A Ti Gba Owo*
+
+A ti gba ₦${amount} ni aṣeyọri.
+
+🔥 Ọjọ ${dayNumber} ninu 30
+
+Owo ti a ti Fipamọ:
+₦${totalSaved}
+
+Ọjọ ${daysRemaining} to ku.
+
+A o rii lọla.`,
+  ig: ({ amount, dayNumber, totalSaved, daysRemaining }) =>
+`✅ *Anabatala Ego*
+
+Anabatala ₦${amount} nke ọma.
+
+🔥 Ụbọchị ${dayNumber} n'ime 30
+
+Ngụkọta Echekwara:
+₦${totalSaved}
+
+Ụbọchị ${daysRemaining} fọdụrụ.
+
+Ka ọ dị echi.`,
 }
 
 const DAILY_REMINDER = {
@@ -1229,6 +1285,36 @@ Current streak:
 ${streakDays} days
 
 Reply PAID after making your transfer.`,
+  ha: ({ dailyAmount, streakDays }) =>
+`🔔 *Tunatarwar Yau*
+
+Kuɗin yau:
+₦${dailyAmount}
+
+Kwanakin da kuka tsayu akai:
+${streakDays} kwana
+
+Idan kun riga kun aika, rubuta PAID.`,
+  yo: ({ dailyAmount, streakDays }) =>
+`🔔 *Iranti Ojoojumọ*
+
+Owo oni:
+₦${dailyAmount}
+
+Awọn ọjọ to o ti n tẹsiwaju:
+Ọjọ ${streakDays}
+
+Tẹ PAID lẹhin ti o ba ti fi owo ranṣẹ.`,
+  ig: ({ dailyAmount, streakDays }) =>
+`🔔 *Ncheta Kwa Ụbọchị*
+
+Ego taa:
+₦${dailyAmount}
+
+Ụbọchị ị na-aga n'ihu:
+Ụbọchị ${streakDays}
+
+Pịnye PAID mgbe i zipuchara ego gị.`,
 }
 
 // Commission and net payout are shown even though your example left
@@ -1251,6 +1337,48 @@ MyAjo commission:
 Your payout of ₦${netPayout} has been sent.
 
 Ready to begin your next cycle? Type YES.`,
+  ha: ({ totalSaved, commission, netPayout }) =>
+`🎉 *Taya Murna!*
+
+Kun kammala zubin ajiyar ku na kwana 30.
+
+Ajiya:
+₦${totalSaved}
+
+Kuɗin caji na MyAjo:
+₦${commission}
+
+An aika muku da ₦${netPayout}.
+
+Kuna son fara sabon zubi? Rubuta YES.`,
+  yo: ({ totalSaved, commission, netPayout }) =>
+`🎉 *Oriire!*
+
+O ti pari ipe ifowopamọ ọjọ 30 rẹ.
+
+Ifowopamọ:
+₦${totalSaved}
+
+Owo iṣẹ MyAjo:
+₦${commission}
+
+A ti fi owo rẹ ₦${netPayout} ranṣẹ.
+
+Ṣe o fẹ bẹrẹ ipe tuntun? Tẹ YES.`,
+  ig: ({ totalSaved, commission, netPayout }) =>
+`🎉 *Ekele!*
+
+Ị gụchara usoro nchekwa gị nke ụbọchị 30.
+
+Nchekwa:
+₦${totalSaved}
+
+Ụgwọ ọrụ MyAjo:
+₦${commission}
+
+Ezipula gị ₦${netPayout}.
+
+Ị chọrọ ịmalite usoro ọhụrụ? Pịnye YES.`,
 }
 
 export function getMessage(key, lang, params = {}) {
@@ -1260,9 +1388,9 @@ export function getMessage(key, lang, params = {}) {
   if (key === 'welcome') return WELCOME[safeLang].replace('{disclaimer}', DISCLAIMER[safeLang])
   if (key === 'help') return HELP[safeLang].replace('{disclaimer}', DISCLAIMER[safeLang])
   if (key === 'balance') return BALANCE[safeLang](params)
-  if (key === 'contribution_recorded') return CONTRIBUTION_RECORDED.en(params)
-  if (key === 'daily_reminder') return DAILY_REMINDER.en(params)
-  if (key === 'cycle_complete') return CYCLE_COMPLETE.en(params)
+  if (key === 'contribution_recorded') return pick(CONTRIBUTION_RECORDED)
+  if (key === 'daily_reminder') return pick(DAILY_REMINDER)
+  if (key === 'cycle_complete') return pick(CYCLE_COMPLETE)
 
   if (key === 'active_cycle_exists') return pick(ACTIVE_CYCLE_EXISTS)
   if (key === 'returning_trader_new_cycle') return pick(RETURNING_TRADER_NEW_CYCLE)
