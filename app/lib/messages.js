@@ -58,7 +58,7 @@ Please choose your language / Zaɓi harshenka / Họrọ asụsụ gị / Yan ed
 const DISCLAIMER = {
   en: 'Important: MyAjo only recognises contributions made through this WhatsApp number or MyAjo USSD. Any transfer or cash payment made outside these channels will not be recorded and cannot be refunded.',
   yo: 'Ẹ ṣe akiyesi: MyAjo yoo gba owo ti a fi n ranṣẹ nikan nipasẹ nọmba WhatsApp yii tabi USSD MyAjo. Owo ti a ba fi ranṣẹ ni ọna miiran ko ni han loodo wa a ko de ni le da a pada.',
-  ha: 'Muhimmi: Asusun MyAjo zai karɓi kuɗi ne kawai ta wannan lambar WhatsApp ko USSD na MyAjo. Duk wani kuɗin da aka aika ta wata hanya dabam ba za a rubuta shi ba, kuma babu da hannun MyAjo a ciki. Don haka asarar tana ga wanda yatura kudin.',
+  ha: 'Muhimmi: asusun MyAjo zai karɓi kuɗi ne kawai ta wannan lambar WhatsApp ko USSD na MyAjo. Duk wani kuɗin da aka aika ta wata hanya dabam ba za a rubuta shi ba, kuma babu da hannun MyAjo a ciki. Don haka asarar tana ga wanda yatura kuɗin.',
   ig: 'Ihe dị mkpa: MyAjo ga-anabata naanị ego ezitere site na nọmba WhatsApp a ma ọ bụ USSD MyAjo. Ego ọ bụla ezitere site na ụzọ ọzọ agaghị edekọ ya, a gaghị enyeghachikwa ya azụ.',
 }
 
@@ -91,22 +91,19 @@ Jọwọ yan ọkan:
 4. Ba Support Sọrọ
 
 Dahun pẹlu nọmba nkan to fe se.`,
-  ha: `Barka da zuwa Adashen MyAjo. Ni ce Temi, mataimakiyar ajiyar ku.
-
-Muna tare har sai kun samu jajircewa da  juriya don ajiyar yau da kullum.
-Ina nan don taimaka muku ku samu al'adar ajiya ta yau da kullum.
+  ha: `Barka da zuwa adashen MyAjo. Ni ce Temi, mataimakiyar ajiyar ku.
+Muna tare har sai kun samu jajircewa da juriya don ajiyar yau da kullum.
 
 {disclaimer}
 
-Da fatan za a zaɓi ɗaya:
-Zabi ɗaya daya dace da kudurinka:
+Zaɓi ɗaya daya dace da ƙudurinka:
 
-1. Fara zubi Kullum
-2. Tantace nawa na tara kawo yanzu
+1. Fara zubi kullum
+2. Tantance nawa na tara kawo yanzu
 3. Fahimtar yadda wannan manhajar Yake Aiki
-4. Karin fahimta da neman taimako
+4. Ƙarin fahimta da neman taimako
 
-Ka amsa da lamba: daya, biyu, uku ko hudu.`,
+Ka amsa da lamba: ɗaya, biyu, uku ko huɗu.`,
   ig: `Nnọọ na MyAjo. Abụ m Temi, onye enyemaka nchekwa ego gị.
 
 Anọ m ebe a ka m nyere gị aka ịmepụta omume ịchekwa ego kwa ụbọchị.
@@ -158,14 +155,14 @@ MENU - Koma babban jerin
 BALANCE - Duba ajiyar ku
 PAID - Tabbatar da cewa an aika kuɗin yau
 WITHDRAW 5000 - Cire kuɗi daga ajiyar ku (daga rana ta 10)
-FREEZE - Dakatar da asusun ku
-HELP - Kara nuna wannan jerin bayanan
+FREEZE - Dakatar da adashe
+HELP - ƙara nuno wannan jerin bayanai
 
-Za'a iya cire kuɗi kafin kwanaki 30 su cika amma akwai ƙaramin caji daga bankinda ke tayamu ajiya daga Naira hamsin (N50) har zuwa dubu goma (N10,000, N100 sama da haka).Adashen MyAjo ba ya ƙara komai a kai. Amma idan kuka jure kammala kwanaki 30 cik, toh babu wani caji ko kaɗan da zaku biya.
+Za'a iya cire kuɗi kafin kwanaki 30 su cika amma akwai ƙaramin caji daga bankinda ke tayamu ajiya daga Naira hamsin (N50) har zuwa dubu goma (N10,000, N100 sama da haka). Adashen MyAjo ba ya ƙara komai a kai. Amma idan kuka jure kammala kwanaki 30 cik, toh babu wani caji ko kaɗan da zaku biya.
 
 {disclaimer}
 
-Don karin bayani, tuntuɓi hello@myajo.com.ng`,
+Don ƙarin bayani, tuntuɓi hello@myajo.com.ng`,
   ig: `Iwu Temi
 
 MENU - Laghachi na ndepụta izugbe
@@ -221,13 +218,14 @@ E tesiwaju lati fi owo pamọ lojoojumọ!`,
 Sannu ${name}
 
 An ajiye: N${saved}
-Kwanakin da aka kammala: ${daysContributed} zubi nawa nayi a cikin kwana 30
+Kwanakin da aka kammala: ${daysContributed}
+Zubi nawa nayi a cikin kwana 30
 
 Ci gaba: ${progressBar} ${progressPercent}%
 
 Jimlar da ake tsammani: N${expectedTotal}
-Kuɗin caji dawainiyar MyAjo: N${commission}
-Jamillar kuɗi na: N${expectedPayout}${withdrawLine}
+Kuɗin cajin ɗawainiyar MyAjo: N${commission}
+Jimillar kuɗi na: N${expectedPayout}${withdrawLine}
 
 Ci gaba da ajiya kowace rana!`,
   ig: ({ name, saved, daysContributed, progressBar, progressPercent, expectedTotal, commission, expectedPayout, withdrawLine }) =>
@@ -257,7 +255,7 @@ const ACTIVE_CYCLE_EXISTS = {
 Type BALANCE to check your savings, PAID to confirm today's transfer, or WITHDRAW followed by an amount to withdraw.`,
   ha: `Kuna da zubi mai aiki tuni.
 
-Rubuta BALANCE domin duba ajiyar ku, PAID domin tabbatar da kudin yau, ko WITHDRAW sannan adadin domin cire kuɗi.`,
+Rubuta BALANCE domin duba ajiyar ku, PAID domin tabbatar da kuɗin yau, ko WITHDRAW sannan adadin domin cire kuɗi.`,
   ig: `Ị nweelarị usoro nchekwa ego na-arụ ọrụ ugbu a.
 
 Pịnye BALANCE iji lelee nchekwa gị, PAID iji kwenye na ego taa abanyela, ma ọ bụ WITHDRAW gbakwunyere ọnụọgụ iji wepụ ego.`,
@@ -307,7 +305,7 @@ GTBank
 Once you've done both, type DONE.`,
   ha: ({ verifyLink }) => `Madalla! Bari mu shirya tsarin ajiyar ku. Abubuwa biyu za a yi — kowanne zai iya farawa:
 
-1) Tabbatar da ainihin ku a nan (yana ɗaukar minti daya kacal):
+1) Tabbatar da ainihin ku a nan (yana ɗaukar minti ɗaya kacal):
 ${verifyLink}
 
 2) Amsa a nan da bayananku, layi ɗaya-ɗaya:
@@ -408,7 +406,7 @@ Lẹhinna tẹ DONE.`,
 
 const STILL_CHECKING_VERIFICATION = {
   en: `Still checking your verification, this usually takes just a moment. Please type DONE again in a minute.`,
-  ha: `Muna ci gaba da duba tabbaci, wannan yakan ɗauki ɗan lokaci kaɗan. Da fatan za a sake rubuta DONE bayan minti daya.`,
+  ha: `Muna ci gaba da duba tabbaci, wannan yakan ɗauki ɗan lokaci kaɗan. Da fatan za a sake rubuta DONE bayan minti ɗaya.`,
   ig: `Ka anyị na-elele nkwado gị, nke a na-ewekarị nanị obere oge. Biko pịnye DONE ọzọ ka otu nkeji gachaa.`,
   yo: `A si n ṣayẹwo ijẹrisi rẹ, eyi maa n gba akoko diẹ. Jọwọ tẹ DONE lẹẹkansi ni iṣẹju kan.`,
 }
@@ -1031,7 +1029,7 @@ This takes about a minute. You don't need to re-enter any other details — once
 
 ${verifyLink}
 
-Wannan yana ɗaukar minti daya kacal. Ba kwa buƙatar sake shigar da wasu bayanai — da zarar tabbaci ya kammala, za mu tuntuɓe ku nan.`,
+Wannan yana ɗaukar minti ɗaya kacal. Ba kwa buƙatar sake shigar da wasu bayanai — da zarar tabbaci ya kammala, za mu tuntuɓe ku nan.`,
   ig: ({ verifyLink }) => `Ọ dịghị nsogbu — gosi onye ị bụ ebe a anyị ga-ejikọtakwa akaụntụ MyAjo gị na nọmba a na akpaaka:
 
 ${verifyLink}
@@ -1238,9 +1236,9 @@ See you tomorrow.`,
 
 An karɓi ₦${amount} cikin nasara.
 
-🔥 Rana ${dayNumber} cikin 30
+🔥 Rana ${dayNumber} cikin kwana 30
 
-Jimlar da aka Ajiye:
+An ajiye:
 ₦${totalSaved}
 
 Kwana ${daysRemaining} sun rage.
@@ -1342,10 +1340,10 @@ Ready to begin your next cycle? Type YES.`,
 
 Kun kammala zubin ajiyar ku na kwana 30.
 
-Ajiya:
+An ajiye:
 ₦${totalSaved}
 
-Kuɗin caji na MyAjo:
+Kuɗin cajin ɗawainiyar MyAjo:
 ₦${commission}
 
 An aika muku da ₦${netPayout}.
