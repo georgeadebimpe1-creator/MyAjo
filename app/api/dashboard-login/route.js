@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { passwordMatches, createSessionToken } from '../../lib/dashboardAuth'
+import { passwordMatches, createSessionToken } from '../../lib/dashboardauth'
 
 const SESSION_SECONDS = 60 * 60 * 24 * 7 // stays logged in for 7 days
 
