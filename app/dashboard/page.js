@@ -1,51 +1,51 @@
 'use client'
 import { useState, useEffect } from 'react'
-import { supabase } from '../lib/supabase'
+import { useRouter } from 'next/navigation'
 
 export default function Dashboard() {
-  const [stats, setStats] = useState({ totalTraders: 0, activeCycles: 0, totalSaved: 0, totalCommission: 0 })
+  const [stats, setStats] = useState({ totalTraders: 0, activeCycles: 0, totalSaved: 0, commissionOnActiveCycles: 0 })
   const [cycles, setCycles] = useState([])
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const router = useRouter()
 
   useEffect(() => {
     fetchDashboard()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // Data now comes from our own server route (which uses the admin database
+  // connection) instead of the browser talking to the database directly.
   async function fetchDashboard() {
     setLoading(true)
+    setError('')
 
-    const { data: usersData } = await supabase
-      .from('users')
-      .select('id', { count: 'exact' })
+    try {
+      const response = await fetch('/api/dashboard-data', { cache: 'no-store' })
 
-    const { data: cyclesData } = await supabase
-      .from('cycles')
-      .select('id, daily_amount, days_contributed, total_saved, commission, status, start_date, users(full_name, whatsapp_number)')
-      .eq('status', 'active')
-      .order('start_date', { ascending: false })
+      if (response.status === 401) {
+        router.push('/dashboard-login')
+        return
+      }
 
-    if (cyclesData) {
-      const totalSaved = cyclesData.reduce((sum, c) => sum + parseFloat(c.total_saved || 0), 0)
-      const totalCommission = cyclesData.reduce((sum, c) => sum + parseFloat(c.commission || 0), 0)
-      setStats({
-        totalTraders: usersData?.length || 0,
-        activeCycles: cyclesData.length,
-        totalSaved,
-        totalCommission,
-      })
-      setCycles(cyclesData)
+      if (!response.ok) {
+        setError('The dashboard could not load its data. Please refresh, and if it keeps happening, check the Vercel logs.')
+        setLoading(false)
+        return
+      }
+
+      const data = await response.json()
+      setStats(data.stats)
+      setCycles(data.cycles)
+    } catch (err) {
+      setError('The dashboard could not reach the server. Please check your connection and refresh.')
     }
+
     setLoading(false)
   }
 
-  function progressPercent(days) {
-    return Math.min((days / 30) * 100, 100).toFixed(0)
-  }
-
-  function expectedPayout(cycle) {
-    const remaining = 30 - cycle.days_contributed
-    const expectedTotal = parseFloat(cycle.total_saved) + (remaining * parseFloat(cycle.daily_amount))
-    return (expectedTotal - parseFloat(cycle.commission)).toLocaleString()
+  function progressPercent(day) {
+    return Math.min((day / 30) * 100, 100).toFixed(0)
   }
 
   if (loading) {
@@ -65,6 +65,12 @@ export default function Dashboard() {
           <p className="text-gray-500 mt-1">Organiser Dashboard</p>
         </div>
 
+        {error && (
+          <div className="bg-red-50 border border-red-200 text-red-700 text-sm rounded-xl p-4 mb-6">
+            {error}
+          </div>
+        )}
+
         <div className="grid grid-cols-2 gap-4 mb-8 md:grid-cols-4">
           <div className="bg-white rounded-2xl p-5 shadow-sm">
             <p className="text-sm text-gray-500">Total Traders</p>
@@ -79,8 +85,9 @@ export default function Dashboard() {
             <p className="text-3xl font-bold text-green-800 mt-1">₦{stats.totalSaved.toLocaleString()}</p>
           </div>
           <div className="bg-white rounded-2xl p-5 shadow-sm">
-            <p className="text-sm text-gray-500">Total Commission</p>
-            <p className="text-3xl font-bold text-orange-600 mt-1">₦{stats.totalCommission.toLocaleString()}</p>
+            <p className="text-sm text-gray-500">Commission on Active Cycles</p>
+            <p className="text-3xl font-bold text-orange-600 mt-1">₦{stats.commissionOnActiveCycles.toLocaleString()}</p>
+            <p className="text-xs text-gray-400 mt-1">Set at cycle start, not yet earned</p>
           </div>
         </div>
 
@@ -94,24 +101,24 @@ export default function Dashboard() {
                 <div key={cycle.id} className="border border-gray-100 rounded-xl p-4">
                   <div className="flex justify-between items-start">
                     <div>
-                      <p className="font-semibold text-gray-800">{cycle.users?.full_name}</p>
-                      <p className="text-sm text-gray-400">{cycle.users?.whatsapp_number}</p>
+                      <p className="font-semibold text-gray-800">{cycle.fullName}</p>
+                      <p className="text-sm text-gray-400">{cycle.whatsappNumber}</p>
                     </div>
                     <div className="text-right">
-                      <p className="text-sm font-bold text-green-700">₦{parseFloat(cycle.daily_amount).toLocaleString()}/day</p>
-                      <p className="text-xs text-gray-400">Started {cycle.start_date}</p>
+                      <p className="text-sm font-bold text-green-700">₦{cycle.dailyAmount.toLocaleString()}/day</p>
+                      <p className="text-xs text-gray-400">Started {cycle.startDate}</p>
                     </div>
                   </div>
 
                   <div className="mt-3">
                     <div className="flex justify-between text-xs text-gray-500 mb-1">
-                      <span>Day {cycle.days_contributed} of 30</span>
-                      <span>{progressPercent(cycle.days_contributed)}% complete</span>
+                      <span>Day {cycle.cycleDayNumber} of 30 (paid {cycle.daysContributed} {cycle.daysContributed === 1 ? 'day' : 'days'})</span>
+                      <span>{progressPercent(cycle.cycleDayNumber)}% of cycle passed</span>
                     </div>
                     <div className="w-full bg-gray-100 rounded-full h-2">
                       <div
                         className="bg-green-600 h-2 rounded-full transition-all"
-                        style={{ width: progressPercent(cycle.days_contributed) + '%' }}
+                        style={{ width: progressPercent(cycle.cycleDayNumber) + '%' }}
                       />
                     </div>
                   </div>
@@ -119,15 +126,15 @@ export default function Dashboard() {
                   <div className="mt-3 grid grid-cols-3 gap-2 text-center">
                     <div className="bg-green-50 rounded-lg p-2">
                       <p className="text-xs text-gray-500">Saved</p>
-                      <p className="text-sm font-bold text-green-700">₦{parseFloat(cycle.total_saved).toLocaleString()}</p>
+                      <p className="text-sm font-bold text-green-700">₦{cycle.totalSaved.toLocaleString()}</p>
                     </div>
                     <div className="bg-orange-50 rounded-lg p-2">
                       <p className="text-xs text-gray-500">Commission</p>
-                      <p className="text-sm font-bold text-orange-600">₦{parseFloat(cycle.commission).toLocaleString()}</p>
+                      <p className="text-sm font-bold text-orange-600">₦{cycle.commission.toLocaleString()}</p>
                     </div>
                     <div className="bg-blue-50 rounded-lg p-2">
                       <p className="text-xs text-gray-500">Expected Payout</p>
-                      <p className="text-sm font-bold text-blue-700">₦{expectedPayout(cycle)}</p>
+                      <p className="text-sm font-bold text-blue-700">₦{cycle.expectedPayout.toLocaleString()}</p>
                     </div>
                   </div>
                 </div>
