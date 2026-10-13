@@ -1,10 +1,10 @@
 import { NextResponse } from 'next/server'
-import { verifySessionToken } from './app/lib/dashboardAuth'
+import { verifySessionToken } from './app/lib/dashboardauth'
 
 // Protects /dashboard and the data it loads. Without this, anyone with the
 // URL could see every trader's real name, phone number and savings amount.
 //
-// The login cookie now holds a signed token (see app/lib/dashboardAuth.js),
+// The login cookie now holds a signed token (see app/lib/dashboardauth.js),
 // so it can't be faked by typing a cookie by hand.
 export async function middleware(request) {
   const token = request.cookies.get('myajo_dashboard_auth')?.value
