@@ -1,10 +1,14 @@
+
 // app/lib/withdrawalLogic.js
 //
 // Pure, testable math for MyAjo's withdrawal rules. No Supabase, no Twilio.
 //
 // THE RULES:
-// 1. cycles.commission is already locked at cycle creation (= daily_amount).
-//    This file doesn't touch that — it's just read as a given.
+// 1. cycles.commission is locked at cycle creation (the tier fee, see
+//    calculateCommission in savings.js). This file doesn't touch that, it is
+//    just read as a given. The commission is held back from the withdrawable
+//    balance from the very first payment (see getWithdrawableBalance in
+//    withdrawal.js), so a trader can never withdraw it.
 // 2. No withdrawal before day 10 (days_contributed >= 10).
 // 3. Any withdrawal before day 30 — full or partial — costs a fee,
 //    deducted from that withdrawal, always disclosed as Anchor's fee:
@@ -12,8 +16,12 @@
 //      - N100 for withdrawals above N10,000 (N50 payout fee + N50 stamp duty)
 // 4. Day 30, full amount, no earlier withdrawals taken → N0 fee. MyAjo
 //    absorbs Anchor's real fee out of the locked commission.
-// 5. A withdrawal that empties the withdrawable balance behaves like a
-//    full withdrawal — cycle ends.
+// 5. A withdrawal before day 30 NEVER ends the cycle, even if it takes
+//    everything the trader is allowed to withdraw. The commission stays
+//    reserved in the trader's own account and the cycle keeps running, so a
+//    trader who wants to keep saving can. The commission is collected when
+//    the cycle ends on day 30 (see processWithdrawal and
+//    collectRemainingCommission in withdrawal.js).
 // 6. BANK CHANGE FEE: if the trader changed their payout bank (CHANGEBANK),
 //    a N200 fee is owed (users.bank_change_fee_owed). It is taken from
 //    the NEXT payout, on top of any other fee, and shown in the quote.
@@ -50,7 +58,9 @@ export function calculateWithdrawalFee({ requestedAmount, cycleDayNumber, withdr
     }
   }
 
-  const payoutType = isFullWithdrawal ? 'early_full' : 'early_partial'
+  // Before day 30 every withdrawal is 'early_partial', whatever its size.
+  // Only a full withdrawal on or after day 30 completes the cycle (above).
+  const payoutType = 'early_partial'
 
   if (requestedAmount <= FEE_THRESHOLD) {
     return {
