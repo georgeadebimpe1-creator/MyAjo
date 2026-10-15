@@ -10,8 +10,9 @@
 //      created and verified during onboarding (see accounts.js).
 //
 // For a partial/early withdrawal (commission === 0, since commission is
-// only charged at full cycle completion — see withdrawal.js), only the
-// NIP transfer happens.
+// only collected when the cycle ends on day 30, see withdrawal.js), only the
+// NIP transfer happens. When a cycle ends with nothing left to pay out,
+// anchorCommissionSweep (below) moves just the commission.
 import { supabaseAdmin } from './supabase'
 import { initiateBookTransfer, initiateNipTransfer, verifyTransfer } from './anchor'
 
@@ -139,3 +140,53 @@ export async function anchorPayout({ userId, amount, commission = 0, skipCommiss
 
   return { success: true, bankReference: transfer.transferId, commissionSwept }
 }
+
+/**
+ * Moves ONLY the commission from the trader's own account into MyAjo's
+ * master account. Used at the end of a cycle when the trader has nothing
+ * left to be paid (see collectRemainingCommission in withdrawal.js).
+ *
+ * @param {object} params
+ * @param {string} params.userId - trader's Supabase user id
+ * @param {number} params.amount - amount to move, in Naira
+ * @returns {Promise<{ success: boolean, commissionSwept: boolean, bankReference?: string, reason?: string }>}
+ */
+export async function anchorCommissionSweep({ userId, amount }) {
+  if (!ANCHOR_MASTER_ACCOUNT_ID) {
+    console.error('anchorCommissionSweep: ANCHOR_MASTER_ACCOUNT_ID is not set')
+    return { success: false, commissionSwept: false, reason: 'Commission collection is not fully configured yet.' }
+  }
+
+  if (!(amount > 0)) {
+    return { success: false, commissionSwept: false, reason: 'Nothing to collect.' }
+  }
+
+  const { data: user, error } = await supabaseAdmin
+    .from('users')
+    .select('anchor_account_id')
+    .eq('id', userId)
+    .single()
+
+  if (error || !user?.anchor_account_id) {
+    console.error('anchorCommissionSweep: could not load the trader account', userId, error)
+    return { success: false, commissionSwept: false, reason: 'Could not load the trader account.' }
+  }
+
+  try {
+    const sweep = await initiateBookTransfer({
+      fromAccountId: user.anchor_account_id,
+      toAccountId: ANCHOR_MASTER_ACCOUNT_ID,
+      amountNaira: amount,
+      reason: 'MyAjo commission',
+      reference: `myajo-commission-${userId}-${Date.now()}`,
+    })
+    if (sweep.status !== 'COMPLETED' && sweep.status !== 'PENDING') {
+      console.error('anchorCommissionSweep: unexpected status', userId, sweep)
+      return { success: false, commissionSwept: false, reason: 'Commission transfer was not accepted.' }
+    }
+    return { success: true, commissionSwept: true, bankReference: sweep.transferId }
+  } catch (err) {
+    console.error('anchorCommissionSweep: transfer failed', userId, err)
+    return { success: false, commissionSwept: false, reason: 'Commission transfer failed.' }
+  }
+    }
