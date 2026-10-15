@@ -375,6 +375,17 @@ export async function POST(request) {
     if (cycleDayNumber >= 30) {
       const updatedCycle = { ...cycle, days_contributed: newDays, total_saved: newTotal }
       const withdrawableBalance = await getWithdrawableBalance(updatedCycle)
+
+      // Nothing to pay out (everything allowed was already withdrawn, or
+      // the trader saved no more than the commission). processWithdrawal
+      // would refuse a N0 payout and the trader would wrongly be told
+      // their payout failed. The daily sweep collects the commission and
+      // closes this cycle instead, so just leave it for that.
+      if (withdrawableBalance <= 0) {
+        console.log('Anchor webhook: day 30 reached with nothing to pay out, daily sweep will collect the commission', { cycleId: cycle.id })
+        return new NextResponse('OK', { status: 200 })
+      }
+
       const result = await processWithdrawal(cycle.id, withdrawableBalance, anchorPayout)
 
       if (result.success) {
