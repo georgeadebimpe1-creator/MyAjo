@@ -12,7 +12,7 @@
 // still shows the payout as 'pending' or the cycle as 'active'.
 
 import { supabaseAdmin } from './supabase'
-import { quoteWithdrawal } from './withdrawalLogic'
+import { quoteWithdrawal, isCycleComplete } from './withdrawalLogic'
 import { sendAdminAlert } from './alerts'
 import { getCycleDayNumber } from './savings'
 import { getWithdrawalHold } from './bankChange'
@@ -127,8 +127,40 @@ export async function processWithdrawal(cycleId, requestedAmount, payoutFn) {
     return { success: false, reason: freshQuote.reason }
   }
 
-  const commission = freshQuote.payoutType === 'cycle_completion' ? parseFloat(cycle.commission) : 0
+  // COMMISSION LOCK: the commission is held back from the withdrawable
+  // balance from the first payment (see getWithdrawableBalance), so the
+  // trader can never withdraw it, and it stays in their own account while
+  // the cycle runs. A withdrawal before day 30, even one that takes
+  // everything allowed, does not end the cycle and does not touch the
+  // commission. It is collected here only when the cycle completes on day 30.
+  // (If there is nothing left to pay out at day 30, see
+  // collectRemainingCommission below.)
+  const endsCycleNow = freshQuote.payoutType === 'cycle_completion'
+  const commission = endsCycleNow ? parseFloat(cycle.commission) : 0
   const bankChangeFee = freshQuote.bankChangeFee || 0
+
+  // RETRY PROTECTION: if an earlier attempt for this cycle already moved the
+  // commission to MyAjo and then failed later (for example the bank transfer
+  // to the trader failed), do not move it a second time. Only attempts that
+  // recorded a commission above zero count, so a partial withdrawal that only
+  // collected a bank change fee is not mistaken for a commission sweep.
+  // If we cannot check, we stop: charging twice is worse than waiting.
+  let skipCommissionSweep = false
+  if (commission > 0) {
+    const { data: priorSweeps, error: priorSweepErr } = await supabaseAdmin
+      .from('payouts')
+      .select('id')
+      .eq('cycle_id', cycle.id)
+      .eq('commission_swept', true)
+      .gt('commission', 0)
+      .limit(1)
+
+    if (priorSweepErr) {
+      console.error('processWithdrawal: could not check for an earlier commission sweep', cycle.id, priorSweepErr)
+      return { success: false, reason: 'We could not check your account right now. Please try again shortly.' }
+    }
+    skipCommissionSweep = (priorSweeps || []).length > 0
+  }
 
   const { data: payout, error: insertErr } = await supabaseAdmin
     .from('payouts')
@@ -156,16 +188,26 @@ export async function processWithdrawal(cycleId, requestedAmount, payoutFn) {
   // (a book transfer out of the trader's account just before the bank
   // payout), so it is added to the `commission` argument here. The
   // payouts.commission column above still records commission only.
-  const payoutResult = await payoutFn({ userId: cycle.user_id, amount: freshQuote.netAmount, commission: commission + bankChangeFee })
+  const payoutResult = await payoutFn({ userId: cycle.user_id, amount: freshQuote.netAmount, commission: commission + bankChangeFee, skipCommissionSweep })
 
   if (!payoutResult.success) {
     const { error: failUpdateErr } = await supabaseAdmin
       .from('payouts')
-      .update({ status: 'failed', failed_reason: payoutResult.reason || 'Unknown error' })
+      .update({
+        status: 'failed',
+        failed_reason: payoutResult.reason || 'Unknown error',
+        commission_swept: !!payoutResult.commissionSwept,
+      })
       .eq('id', payout.id)
 
     if (failUpdateErr) {
       console.error('processWithdrawal: could not mark payout failed', payout.id, failUpdateErr)
+      if (payoutResult.commissionSwept) {
+        await sendAdminAlert(
+          'Commission moved but could not be recorded',
+          `A payout failed AFTER the commission had already been moved to MyAjo, and that fact could not be saved.\n\nPayout ID: ${payout.id}\nCycle ID: ${cycle.id}\nSupabase error: ${failUpdateErr.message || JSON.stringify(failUpdateErr)}\n\nSet payouts.commission_swept = true for this payout by hand, otherwise a retry could collect the commission a second time.`
+        )
+      }
     }
     return { success: false, reason: 'The payout could not be completed. Please try again shortly, or contact support.' }
   }
@@ -189,10 +231,10 @@ export async function processWithdrawal(cycleId, requestedAmount, payoutFn) {
     }
   }
 
-  const cycleEnding =
-    freshQuote.payoutType === 'early_full' ||
-    freshQuote.payoutType === 'cycle_completion' ||
-    withdrawableBalance - freshQuote.requestedAmount <= 0
+  // Only a day-30 completion ends the cycle. A withdrawal that empties the
+  // withdrawable balance earlier leaves the cycle active, so the trader can
+  // keep saving and the reserved commission is collected on day 30.
+  const cycleEnding = freshQuote.payoutType === 'cycle_completion'
 
   const cycleUpdate = { status: cycleEnding ? 'completed' : 'active' }
   if (freshQuote.payoutType === 'early_partial') {
@@ -237,6 +279,7 @@ export async function processWithdrawal(cycleId, requestedAmount, payoutFn) {
       status: 'completed',
       completed_at: new Date().toISOString(),
       bank_reference: payoutResult.bankReference || null,
+      commission_swept: !!payoutResult.commissionSwept,
     })
     .eq('id', payout.id)
 
@@ -260,6 +303,181 @@ export async function processWithdrawal(cycleId, requestedAmount, payoutFn) {
   }
 }
 
+/**
+ * DAY-30 CLOSE WHEN THERE IS NOTHING LEFT TO PAY OUT.
+ *
+ * Normally the commission is collected inside processWithdrawal, together
+ * with the trader's final payout. But if the trader has already withdrawn
+ * everything they were allowed to, or never saved more than the commission,
+ * there is nothing to pay out and processWithdrawal cannot run (it refuses a
+ * N0 payout). This covers that case: it moves the commission to MyAjo (or
+ * whatever was saved, if that is less than the commission) and closes the
+ * cycle.
+ *
+ * Safe to call repeatedly: it does nothing before day 30, never touches a
+ * cycle that is not active, never collects twice, and if it cannot be sure
+ * an earlier attempt finished it stops and raises an alert instead of
+ * risking a double charge.
+ *
+ * sweepFn: ({ userId, amount }) => { success, commissionSwept, bankReference?, reason? }
+ */
+export async function collectRemainingCommission(cycleId, sweepFn) {
+  const { data: cycle, error: cycleErr } = await supabaseAdmin
+    .from('cycles')
+    .select('*')
+    .eq('id', cycleId)
+    .single()
+
+  if (cycleErr || !cycle) {
+    return { success: false, reason: 'Could not load this cycle.' }
+  }
+  if (cycle.status !== 'active') {
+    return { success: false, reason: 'This cycle is already closed.' }
+  }
+  if (!isCycleComplete(getCycleDayNumber(cycle.start_date))) {
+    return { success: false, reason: 'This cycle has not reached day 30 yet.' }
+  }
+
+  const { data: payouts, error: payoutsErr } = await supabaseAdmin
+    .from('payouts')
+    .select('id, gross_amount, commission, commission_swept, status, payout_type')
+    .eq('cycle_id', cycle.id)
+
+  if (payoutsErr) {
+    console.error('collectRemainingCommission: could not load payouts', cycle.id, payoutsErr)
+    return { success: false, reason: 'Could not check earlier payouts for this cycle.' }
+  }
+
+  const history = payouts || []
+
+  // An earlier collection that started but never finished recording. We
+  // cannot tell whether the money moved, so we do not try again by ourselves.
+  const unfinished = history.find(
+    (p) => p.payout_type === 'commission_collection' && p.status === 'pending'
+  )
+  if (unfinished) {
+    await sendAdminAlert(
+      'Commission collection needs a manual check',
+      `An earlier attempt to collect the commission for this cycle started but was never marked finished, so it was NOT repeated (to avoid taking it twice).\n\nCycle ID: ${cycle.id}\nPayout ID: ${unfinished.id}\n\nCheck in Anchor whether the commission transfer went through. If it did, mark that payout completed with commission_swept = true and set the cycle to completed. If it did not, delete that payout row and the next daily run will try again.`
+    )
+    return { success: false, reason: 'An earlier commission collection needs a manual check.' }
+  }
+
+  const alreadyWithdrawn = history
+    .filter((p) => p.status === 'completed')
+    .reduce((sum, p) => sum + parseFloat(p.gross_amount || 0), 0)
+  const alreadyCollected = history.some(
+    (p) => p.commission_swept === true && parseFloat(p.commission || 0) > 0
+  )
+
+  const totalSaved = parseFloat(cycle.total_saved || 0)
+  const commission = parseFloat(cycle.commission || 0)
+  const available = Math.max(totalSaved - alreadyWithdrawn, 0)
+  const toCollect = alreadyCollected ? 0 : Math.min(commission, available)
+
+  async function closeCycle(status) {
+    const { error: closeErr } = await supabaseAdmin
+      .from('cycles')
+      .update({ status, paid_out_at: new Date().toISOString() })
+      .eq('id', cycle.id)
+    if (closeErr) {
+      console.error('collectRemainingCommission: could not close cycle', cycle.id, closeErr)
+      await sendAdminAlert(
+        'Cycle could not be closed after day-30 handling',
+        `Cycle ID: ${cycle.id}\nIntended status: ${status}\nSupabase error: ${closeErr.message || JSON.stringify(closeErr)}\n\nThe commission step is already recorded, so the next daily run will close it without collecting anything again. If it keeps happening, set the status by hand.`
+      )
+      return false
+    }
+    return true
+  }
+
+  // The commission was already collected earlier (for example by a payout
+  // attempt that moved it and then failed). Just close the cycle.
+  if (alreadyCollected) {
+    const closed = await closeCycle('completed')
+    return { success: true, collected: 0, alreadyCollected: true, closed }
+  }
+
+  // Nothing was ever saved, so there is nothing to collect.
+  if (toCollect <= 0) {
+    const closed = await closeCycle('abandoned')
+    return { success: true, collected: 0, nothingSaved: true, closed }
+  }
+
+  const { data: row, error: insertErr } = await supabaseAdmin
+    .from('payouts')
+    .insert([{
+      cycle_id: cycle.id,
+      user_id: cycle.user_id,
+      gross_amount: 0,
+      commission: toCollect,
+      net_amount: 0,
+      payout_type: 'commission_collection',
+      withdrawal_fee: 0,
+      bank_change_fee: 0,
+      fee_reason: 'Commission collected at the end of the cycle. Nothing was left to pay out.',
+      status: 'pending',
+      initiated_at: new Date().toISOString(),
+    }])
+    .select()
+    .single()
+
+  if (insertErr || !row) {
+    console.error('collectRemainingCommission: could not log the collection', cycle.id, insertErr)
+    return { success: false, reason: 'Could not log the commission collection.' }
+  }
+
+  let sweep
+  try {
+    sweep = await sweepFn({ userId: cycle.user_id, amount: toCollect })
+  } catch (err) {
+    // We do not know whether the money moved. Leave the row pending so the
+    // next run stops and alerts instead of risking a second transfer.
+    console.error('collectRemainingCommission: sweep threw', cycle.id, err)
+    await sendAdminAlert(
+      'Commission transfer threw an error',
+      `Cycle ID: ${cycle.id}\nPayout ID: ${row.id}\nAmount: N${toCollect}\nError: ${err?.message || String(err)}\n\nWe cannot tell whether the money moved. Check in Anchor, then follow the steps in the "Commission collection needs a manual check" alert you will get tomorrow.`
+    )
+    return { success: false, reason: 'The commission transfer could not be confirmed.' }
+  }
+
+  if (!sweep?.success) {
+    const { error: failErr } = await supabaseAdmin
+      .from('payouts')
+      .update({
+        status: 'failed',
+        failed_reason: sweep?.reason || 'Unknown error',
+        commission_swept: !!sweep?.commissionSwept,
+      })
+      .eq('id', row.id)
+    if (failErr) {
+      console.error('collectRemainingCommission: could not mark the collection failed', row.id, failErr)
+    }
+    return { success: false, reason: sweep?.reason || 'The commission could not be collected.' }
+  }
+
+  const { error: doneErr } = await supabaseAdmin
+    .from('payouts')
+    .update({
+      status: 'completed',
+ completed_at: new Date().toISOString(),
+      bank_reference: sweep.bankReference || null,
+      commission_swept: true,
+    })
+    .eq('id', row.id)
+ 
+  if (doneErr) {
+    console.error('collectRemainingCommission: COMMISSION MOVED but record not updated', row.id, doneErr)
+    await sendAdminAlert(
+      'Commission moved but could not be recorded',
+      `The commission for this cycle was moved to MyAjo, but its record could not be marked completed.\n\nPayout ID: ${row.id}\nCycle ID: ${cycle.id}\nAmount: N${toCollect}\nSupabase error: ${doneErr.message || JSON.stringify(doneErr)}\n\nMark that payout completed with commission_swept = true. Until then the next daily run will stop and alert instead of collecting again.`
+    )
+  }
+ 
+  const closed = await closeCycle('completed')
+  return { success: true, collected: toCollect, closed }
+}
+ 
 /**
  * Stub payout — logs instead of moving real money. Swap for Anchor's
  * disbursement/NIP transfer API once sandbox access is live. Keep the
