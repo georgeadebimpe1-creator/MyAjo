@@ -4,8 +4,8 @@ import { supabaseAdmin } from '../../lib/supabase'
 import { sendMessage, sendProactiveMessage, isWindowOpen } from '../../lib/whatsapp'
 import { getMessage } from '../../lib/messages'
 import { getCycleDayNumber } from '../../lib/savings'
-import { getWithdrawableBalance, processWithdrawal } from '../../lib/withdrawal'
-import { anchorPayout } from '../../lib/payout'
+import { getWithdrawableBalance, processWithdrawal, collectRemainingCommission } from '../../lib/withdrawal'
+import { anchorPayout, anchorCommissionSweep } from '../../lib/payout'
 import { sendAdminAlert } from '../../lib/alerts'
 
 // Vercel Cron calls this once a day with an Authorization header
@@ -53,25 +53,32 @@ export async function GET(request) {
 
       const withdrawableBalance = await getWithdrawableBalance(cycle)
 
-      // ABANDONED CYCLE: nothing was ever saved (or everything already
-      // withdrawn before day 30). This is not a failure — there is
-      // nothing to pay out and nothing to reconcile — so close it
-      // quietly instead of attempting a N0 payout, which fails
-      // validation and would otherwise re-alert every single day this
-      // sweep runs, forever, for a cycle that was likely abandoned or
-      // was test data. No trader message either: a trader who saved
-      // nothing has nothing to be told about.
+      // NOTHING LEFT TO PAY OUT: the trader already withdrew everything
+      // they were allowed to, or never saved more than the commission.
+      // A N0 payout would fail validation, so instead the commission
+      // (or whatever was saved, if that is less) is collected for MyAjo
+      // and the cycle is closed. If NOTHING was ever saved there is
+      // nothing to collect and the cycle is closed quietly as abandoned.
+      // No trader message either way: there is no payout to tell them
+      // about. If collection fails the cycle stays active and this runs
+      // again tomorrow, with an alert so it is not missed.
       if (withdrawableBalance <= 0) {
-        const { error: closeErr } = await supabaseAdmin
-          .from('cycles')
-          .update({ status: 'abandoned' })
-          .eq('id', cycle.id)
+        const collected = await collectRemainingCommission(cycle.id, anchorCommissionSweep)
 
-        if (closeErr) {
-          console.error('Daily reminder: could not close empty cycle', { cycleId: cycle.id, error: closeErr })
-        } else {
+        if (!collected.success) {
+          console.error('Daily reminder: could not collect commission at day 30, needs attention', { cycleId: cycle.id, reason: collected.reason })
+          await sendAdminAlert(
+            'Commission could not be collected at day 30',
+            `Cycle ID: ${cycle.id}\nReason: ${collected.reason}\n\nThe cycle stays active and the daily run will try again tomorrow.`
+          )
+          continue
+        }
+
+        if (collected.nothingSaved) {
           console.log('Daily reminder: closed an empty cycle at day 30+ (nothing was ever saved)', { cycleId: cycle.id })
           abandoned++
+        } else {
+          console.log('Daily reminder: collected the commission and closed the cycle at day 30+', { cycleId: cycle.id, collected: collected.collected })
         }
         closed++
         continue
@@ -218,4 +225,4 @@ export async function GET(request) {
   }
 
   return NextResponse.json({ ok: true, sent, failed, skipped, closed, abandoned })
-}
+            }
