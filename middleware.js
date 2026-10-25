@@ -1,3 +1,5 @@
+// ===== Protects the dashboard and the two new data routes with the login =====
+// GitHub path: middleware.js  (existing file: replace everything)
 import { NextResponse } from 'next/server'
 import { verifySessionToken } from './app/lib/dashboardauth'
 
@@ -25,5 +27,11 @@ export async function middleware(request) {
 }
 
 export const config = {
-  matcher: ['/dashboard', '/dashboard/:path*', '/api/dashboard-data'],
+  matcher: [
+    '/dashboard',
+    '/dashboard/:path*',
+    '/api/dashboard-data',
+    '/api/dashboard-lookup',
+    '/api/dashboard-attention',
+  ],
 }
